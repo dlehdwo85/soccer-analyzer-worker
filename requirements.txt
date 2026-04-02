@@ -1,0 +1,8 @@
+runpod==1.7.3
+ultralytics==8.2.0
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+requests==2.31.0
+yt-dlp==2024.5.27
+Pillow==10.3.0
+scipy==1.13.0
