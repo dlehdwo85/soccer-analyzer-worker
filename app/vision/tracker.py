@@ -1,0 +1,269 @@
+"""선수 추적: IoU 기반 2단계 매칭 트래커 + 끊긴 트랙(tracklet) 이어붙이기.
+
+ByteTrack의 핵심 아이디어(고신뢰 검출 먼저 매칭, 남은 트랙에 저신뢰 검출 재매칭)를
+의존성 없이 구현했다. 등속 예측으로 빠른 선수도 놓치지 않게 하고, 매칭이 안 되면
+중심 거리(박스 높이 대비)로 한 번 더 시도한다.
+
+가림으로 ID가 끊기는 문제는 stitch_tracklets()로 완화한다: 같은 팀이고, 끊긴 시간
+안에 달려갈 수 있는 거리에서 다시 나타난 트랙을 하나로 잇는다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+Box = Tuple[float, float, float, float]  # x1, y1, x2, y2 (px)
+
+
+def iou(a: Box, b: Box) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+@dataclass
+class Detection:
+    box: Box
+    conf: float
+    payload: object = None  # 색상 샘플 등 호출자가 붙이는 데이터
+
+
+@dataclass
+class _Track:
+    tid: int
+    box: Box
+    vel: Tuple[float, float] = (0.0, 0.0)  # 중심 이동 px/frame
+    hits: int = 1
+    missed: int = 0
+    confirmed: bool = False
+    team_votes: Dict[str, float] = field(default_factory=dict)
+
+    def team(self, min_votes: float = 2.0) -> Optional[str]:
+        if not self.team_votes:
+            return None
+        lbl, v = max(self.team_votes.items(), key=lambda kv: kv[1])
+        total = sum(self.team_votes.values())
+        return lbl if v >= min_votes and v / total >= 0.6 else None
+
+    def predicted(self) -> Box:
+        vx, vy = self.vel
+        k = self.missed + 1
+        x1, y1, x2, y2 = self.box
+        return (x1 + vx * k, y1 + vy * k, x2 + vx * k, y2 + vy * k)
+
+    def update(self, box: Box):
+        ocx, ocy = (self.box[0] + self.box[2]) / 2, (self.box[1] + self.box[3]) / 2
+        ncx, ncy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        steps = self.missed + 1
+        nvx, nvy = (ncx - ocx) / steps, (ncy - ocy) / steps
+        self.vel = (0.6 * self.vel[0] + 0.4 * nvx, 0.6 * self.vel[1] + 0.4 * nvy)
+        self.box = box
+        self.hits += 1
+        self.missed = 0
+
+
+@dataclass
+class TrackPoint:
+    frame: int
+    box: Box
+    conf: float
+    payload: object = None
+
+
+class IoUTracker:
+    """프레임마다 update(dets) 호출 → [(track_id, Detection)] 반환(확정 트랙만).
+
+    team_of(payload) → (팀, 신뢰도) 를 주면 팀이 확실히 다른 검출과는 매칭하지 않는다.
+    다른 팀 선수가 엇갈려 지나갈 때 ID가 바뀌는 문제를 막는다.
+    """
+
+    def __init__(self, high_conf: float = 0.45, iou_match: float = 0.2,
+                 max_missed: int = 15, min_hits: int = 2, center_gate: float = 0.6,
+                 team_of: Optional[Callable[[object], Tuple[Optional[str], float]]] = None):
+        self.team_of = team_of
+        self.high_conf = high_conf
+        self.iou_match = iou_match
+        self.max_missed = max_missed
+        self.min_hits = min_hits
+        self.center_gate = center_gate  # 박스 높이 대비 허용 중심 거리
+        self.tracks: Dict[int, _Track] = {}
+        self._next = 1
+        self.history: Dict[int, List[TrackPoint]] = {}
+        self._pending: Dict[int, List[TrackPoint]] = {}
+
+    def _team_conflict(self, tr: "_Track", det: Detection) -> bool:
+        if self.team_of is None:
+            return False
+        t_team = tr.team()
+        d_team, d_conf = self.team_of(det.payload)
+        return bool(t_team and d_team and d_conf >= 0.5 and d_team != t_team)
+
+    def _match(self, track_ids: List[int], dets: List[Tuple[int, Detection]]):
+        pairs = []
+        for tid in track_ids:
+            tr = self.tracks[tid]
+            pb = tr.predicted()
+            ph = max(1.0, pb[3] - pb[1])
+            pcx, pcy = (pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2
+            for di, det in dets:
+                if self._team_conflict(tr, det):
+                    continue
+                s = iou(pb, det.box)
+                if s >= self.iou_match:
+                    pairs.append((s + 1.0, tid, di))  # IoU 매칭 우선
+                    continue
+                dcx, dcy = (det.box[0] + det.box[2]) / 2, (det.box[1] + det.box[3]) / 2
+                dist = ((pcx - dcx) ** 2 + (pcy - dcy) ** 2) ** 0.5 / ph
+                if dist <= self.center_gate:
+                    pairs.append((1.0 - dist / self.center_gate, tid, di))
+        pairs.sort(key=lambda p: -p[0])
+        used_t, used_d, out = set(), set(), []
+        for _, tid, di in pairs:
+            if tid in used_t or di in used_d:
+                continue
+            used_t.add(tid)
+            used_d.add(di)
+            out.append((tid, di))
+        return out, used_t, used_d
+
+    def update(self, frame: int, detections: Sequence[Detection]) -> List[Tuple[int, Detection]]:
+        indexed = list(enumerate(detections))
+        high = [(i, d) for i, d in indexed if d.conf >= self.high_conf]
+        low = [(i, d) for i, d in indexed if d.conf < self.high_conf]
+
+        active = list(self.tracks.keys())
+        m1, used_t, used_d = self._match(active, high)
+        remaining = [t for t in active if t not in used_t]
+        m2, used_t2, used_d2 = self._match(remaining, low)
+        matches = m1 + m2
+        used_t |= used_t2
+        used_d |= used_d2
+
+        results: List[Tuple[int, Detection]] = []
+        for tid, di in matches:
+            det = detections[di]
+            tr = self.tracks[tid]
+            tr.update(det.box)
+            self._vote(tr, det)
+            self._record(tid, frame, det)
+            if not tr.confirmed and tr.hits >= self.min_hits:
+                tr.confirmed = True
+                self.history.setdefault(tid, []).extend(self._pending.pop(tid, []))
+            if tr.confirmed:
+                results.append((tid, det))
+
+        for tid in active:
+            if tid not in used_t:
+                tr = self.tracks[tid]
+                tr.missed += 1
+                if tr.missed > self.max_missed or (not tr.confirmed and tr.missed > 1):
+                    del self.tracks[tid]
+                    self._pending.pop(tid, None)
+
+        for i, det in high:
+            if i in used_d:
+                continue
+            tid = self._next
+            self._next += 1
+            self.tracks[tid] = _Track(tid=tid, box=det.box)
+            self._vote(self.tracks[tid], det)
+            self._pending[tid] = [TrackPoint(frame, det.box, det.conf, det.payload)]
+            if self.min_hits <= 1:
+                self.tracks[tid].confirmed = True
+                self.history.setdefault(tid, []).extend(self._pending.pop(tid))
+                results.append((tid, det))
+        return results
+
+    def _vote(self, tr: "_Track", det: Detection):
+        if self.team_of is None:
+            return
+        team, conf = self.team_of(det.payload)
+        if team and conf >= 0.3:
+            tr.team_votes[team] = tr.team_votes.get(team, 0.0) + conf
+
+    def _record(self, tid: int, frame: int, det: Detection):
+        pt = TrackPoint(frame, det.box, det.conf, det.payload)
+        if self.tracks[tid].confirmed:
+            self.history.setdefault(tid, []).append(pt)
+        else:
+            self._pending.setdefault(tid, []).append(pt)
+
+
+# ── tracklet 이어붙이기 ───────────────────────────────────────────────────────
+
+@dataclass
+class Tracklet:
+    """경기장 좌표로 변환된 트랙 조각. points: [(t초, x, y)]."""
+    tid: str
+    team: str
+    points: List[Tuple[float, float, float]]
+    color_lab: Optional[np.ndarray] = None
+    members: List[str] = field(default_factory=list)
+
+    @property
+    def start(self) -> Tuple[float, float, float]:
+        return self.points[0]
+
+    @property
+    def end(self) -> Tuple[float, float, float]:
+        return self.points[-1]
+
+
+def stitch_tracklets(tracklets: Sequence[Tracklet], max_gap_s: float = 4.0,
+                     max_speed: float = 8.0, slack_m: float = 3.0,
+                     max_color_de: float = 30.0) -> Dict[str, str]:
+    """끊긴 트랙을 이어 {원래 tid: 대표 tid} 매핑을 반환한다.
+
+    A가 끝난 뒤 B가 시작하고, 같은 팀이며, 공백 시간 안에 이동 가능한 거리이고,
+    (색 정보가 있으면) 색이 비슷할 때 잇는다. 비용이 작은 쌍부터 탐욕적으로 연결하고,
+    한 조각은 앞·뒤로 각각 한 번만 연결된다.
+    """
+    items = sorted(tracklets, key=lambda t: t.start[0])
+    cands = []
+    for a in items:
+        for b in items:
+            if a.tid == b.tid or a.team != b.team:
+                continue
+            gap = b.start[0] - a.end[0]
+            if gap <= 0 or gap > max_gap_s:
+                continue
+            dist = ((a.end[1] - b.start[1]) ** 2 + (a.end[2] - b.start[2]) ** 2) ** 0.5
+            reach = max_speed * gap + slack_m
+            if dist > reach:
+                continue
+            color_pen = 0.0
+            if a.color_lab is not None and b.color_lab is not None:
+                d = a.color_lab - b.color_lab
+                cde = float(np.sqrt((0.5 * d[0]) ** 2 + d[1] ** 2 + d[2] ** 2))
+                if cde > max_color_de:
+                    continue
+                color_pen = cde / max_color_de
+            cost = dist / reach + gap / max_gap_s + 0.5 * color_pen
+            cands.append((cost, a.tid, b.tid))
+    cands.sort()
+
+    nxt: Dict[str, str] = {}
+    prv: Dict[str, str] = {}
+
+    for _, a, b in cands:
+        # 연결은 항상 시간상 앞→뒤이므로 사이클이 생기지 않는다.
+        if a in nxt or b in prv:
+            continue
+        nxt[a] = b
+        prv[b] = a
+
+    mapping: Dict[str, str] = {}
+    for t in items:
+        head = t.tid
+        while head in prv:
+            head = prv[head]
+        mapping[t.tid] = head
+    return mapping

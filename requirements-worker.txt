@@ -1,0 +1,13 @@
+# 영상 분석(YOLO) 의존성 — RunPod 워커(Dockerfile.worker) 또는 서버 직접 분석(Dockerfile의 ENABLE_VIDEO_ANALYSIS=1)
+# PyTorch는 GPU/CPU 환경에 맞게 따로 설치한다 (Dockerfile 참고).
+runpod>=1.6,<2
+requests>=2.31
+# 결과를 R2에 올린다 (worker_handler.py)
+boto3>=1.34,<2
+numpy>=1.26,<2
+ultralytics>=8.3,<9
+# 축구공 전용 모델(ONNX, fetch_ball_model.py) 실행용. GPU 워커는 onnxruntime-gpu로 바꿔 설치한다.
+onnxruntime>=1.18,<2
+# ultralytics가 끌어오는 GUI용 opencv-python을 numpy 1.x 호환 버전으로 고정하고, 설치 후 headless로 교체
+opencv-python<4.11
+opencv-python-headless>=4.9,<4.11

@@ -1,34 +1,15 @@
-# Soccer Analyzer Worker
+# soccer-analyzer-worker
 
-RunPod Serverless Worker for soccer video analysis.
+RunPod Serverless GPU 워커. **직접 고치지 마세요** — [dlehdwo85/soccer-analyzer](https://github.com/dlehdwo85/soccer-analyzer)의
+`backend/`에서 복사한 파일입니다 (원본 커밋 326f12e).
 
-## 기능
-- YOLO v8 선수 감지
-- 색상 기반 팀 분류 (홈/어웨이/심판)
-- 선수 위치 추적 (Simple Tracker)
-- YouTube URL 및 직접 URL 영상 다운로드 지원
+| 이 저장소 | 원본 |
+|---|---|
+| Dockerfile | backend/Dockerfile.worker |
+| worker_handler.py, fetch_ball_model.py, requirements-worker.txt | backend/ 같은 이름 |
+| app/vision/ | backend/app/vision/ |
 
-## 입력 형식
-```json
-{
-  "input": {
-    "match_id": 1,
-    "video_url": "https://...",
-    "home_color": "#56b4d3",
-    "away_color": "#ef4444",
-    "referee_color": "#facc15",
-    "field_type": "soccer"
-  }
-}
-```
+입력: `{"video_url", "config": {..., "quality": "standard"|"max"}, "result_key"}`
+출력: 결과를 R2(`result_key`)에 gzip JSON으로 올리고 `{"status": "done", "result_key", "summary"}`.
 
-## 출력 형식
-```json
-{
-  "status": "success",
-  "match_id": 1,
-  "players": [...],
-  "frames": [...],
-  "player_count": 14
-}
-```
+엔드포인트 환경변수: R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET.
