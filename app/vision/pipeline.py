@@ -34,6 +34,7 @@ from .ball import interpolate_gaps, select_ball_positions
 from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events
 from .pitch import GOAL_WIDTH, PitchMapper
+from .scoreboard import ScoreboardReader
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
 from .tracker import Detection, IoUTracker, Tracklet, stitch_tracklets, suggest_same_player
 
@@ -371,6 +372,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     cam_T: List[np.ndarray] = []   # 프레임별 카메라 변환(현재→기준) — 영상 검수 오버레이에서 원래 화면 좌표로 되돌릴 때 쓴다
     calibrated_colors = False
     calib_frames = max(10, int(cfg.color_calib_s * eff_fps))
+    board = ScoreboardReader(frame_w, frame_h)   # 영상에 박힌 점수 자막 → 골 시각
     removed_outside = 0
 
     def run_tracker(k: int, frame_rgb: Optional[np.ndarray], dets: List):
@@ -411,6 +413,11 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         t = (f_idx - start_f) / fps_video
         persons, balls = detector.detect(frame_rgb)
+        try:
+            board.add(t, frame_rgb)
+        except Exception:  # 부가 기능 — 실패해도 분석은 계속
+            logger.exception("점수 자막 읽기 실패")
+            board.failed = True
         if cam is not None:
             cam_T.append(cam.update(frame_rgb, [b for b, _ in persons]).copy())
             balls = [(*cam.point(bx, by), bc) for bx, by, bc in balls]
@@ -566,12 +573,33 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
               for pid, v in color_by_player.items() if v}
     result = postprocess(frames, cfg, mapper.length, mapper.width, meta, merged_labels, thumbs, colors, progress)
     try:
+        result["meta"]["scoreboard"] = scoreboard_goals(board.finish(), result["events"])
+    except Exception:
+        logger.exception("점수 자막 골 판정 실패")
+    try:
         result["overlay"] = build_overlay(
             tracker.history, {int(k[1:]): "P" + mapping.get(k, k)[1:] for k in geo},
             ball_sel, ball_px, cam_T, frame_w, frame_h, cfg.start_seconds, stride / fps_video, len(times))
     except Exception:  # 검수용 부가 데이터 — 실패해도 분석 결과는 살린다
         logger.exception("영상 검수 오버레이 생성 실패")
     return result
+
+
+def scoreboard_goals(board: Dict, events: List[Dict], left_team: str = "home", window_s: float = 60.0) -> Dict:
+    """점수 자막이 바뀐 시각을 골로 바꾼다. 자막은 보통 골 직후 바뀌므로 그 팀의 직전 슈팅(window_s 안)을
+    득점 장면으로 보고 시각·선수를 붙인다. 자막 왼쪽 팀은 홈팀으로 본다(경기 설정에서 홈·원정을 맞추면 된다)."""
+    if not board.get("found"):
+        return {"found": False}
+    other = {"home": "away", "away": "home"}
+    goals = []
+    for c in board.get("changes", []):
+        team = left_team if c["side"] == "left" else other[left_team]
+        shots = [e for e in events if e["kind"] == "shot" and e["team"] == team and c["t"] - window_s <= e["t"] <= c["t"]]
+        shot = max(shots, key=lambda e: e["t"]) if shots else None
+        goals.append({"t_board": c["t"], "team": team, "side": c["side"],
+                      "t": shot["t"] if shot else c["t"], "player": shot["player"] if shot else None})
+    score = {"home": sum(g["team"] == "home" for g in goals), "away": sum(g["team"] == "away" for g in goals)}
+    return {"found": True, "box": board.get("box"), "goals": goals, "score": score}
 
 
 def build_overlay(history: Dict[int, List], tid_to_pid: Dict[int, str], ball_sel: Sequence, ball_px: Sequence,
