@@ -21,12 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 ff
 
 COPY requirements-worker.txt fetch_ball_model.py ./
 # GPU에서 공 모델을 돌리도록 onnxruntime을 GPU판으로 바꾼다. 최신판은 CUDA 13(1.27+)·12.8용으로 빌드돼
-# 이 이미지(CUDA 12.1·cuDNN 9)에서 CUDA를 못 써 공 검출이 CPU로 돌았다 (2026-11-03 로그) → 1.20으로 고정하고,
+# 이 이미지(CUDA 12.1·cuDNN 9)에서 CUDA를 못 써 공 검출이 CPU로 돌았다 (2026-11-03 로그) → 1.20.2로 고정하고,
 # PyTorch가 pip으로 깔아 둔 CUDA·cuDNN 라이브러리를 onnxruntime도 찾도록 라이브러리 경로에 등록한다.
 RUN pip install --no-cache-dir -r requirements-worker.txt \
     && pip uninstall -y opencv-python onnxruntime \
-    && pip install --no-cache-dir --force-reinstall --no-deps "opencv-python-headless>=4.9" \
-    && pip install --no-cache-dir "onnxruntime-gpu==1.20.1" \
+    && pip install --no-cache-dir --force-reinstall --no-deps "opencv-python-headless>=4.9,<4.11" \
+    && pip install --no-cache-dir "onnxruntime-gpu==1.20.2" \
     && python -c "import glob,site; d=[p for s in site.getsitepackages() for p in glob.glob(s+'/nvidia/*/lib')]; open('/etc/ld.so.conf.d/nvidia-pip.conf','w').write(chr(10).join(d)+chr(10))" \
     && ldconfig
 

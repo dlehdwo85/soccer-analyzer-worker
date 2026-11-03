@@ -35,7 +35,7 @@ from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events
 from .pitch import GOAL_WIDTH, PitchMapper
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
-from .tracker import Detection, IoUTracker, Tracklet, stitch_tracklets
+from .tracker import Detection, IoUTracker, Tracklet, stitch_tracklets, suggest_same_player
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +305,7 @@ class _DetectionCache:
 class _TrackInfo:
     votes: List[Tuple[str, float]] = field(default_factory=list)
     labs: List[np.ndarray] = field(default_factory=list)
+    apps: List[np.ndarray] = field(default_factory=list)   # 머리·반바지·양말 색 (팀원 구분용)
     best_area: float = 0.0
     thumb: Optional[bytes] = None
 
@@ -376,12 +377,15 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         tracked = []
         for box, conf, sample, orig in dets:
             label, lconf = clf.classify(sample)
-            tracked.append(Detection(box, conf, (label, lconf, sample.median_lab if sample else None, orig)))
+            tracked.append(Detection(box, conf, (label, lconf, sample.median_lab if sample else None, orig,
+                                                 sample.appearance if sample else None)))
         for tid, det in tracker.update(k, tracked):
             ti = info[tid]
             ti.votes.append((det.payload[0], det.payload[1]))
             if det.payload[2] is not None:
                 ti.labs.append(det.payload[2])
+            if det.payload[4] is not None and len(ti.apps) < 400:
+                ti.apps.append(det.payload[4])
             ob = det.payload[3]
             area = (ob[2] - ob[0]) * (ob[3] - ob[1])
             if frame_rgb is not None and area > ti.best_area and det.payload[0] in C.TEAM_OF_LABEL:
@@ -475,6 +479,21 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         tracklets.append(Tracklet(key, C.TEAM_OF_LABEL[lbl], [(times[f], x, y) for f, x, y, _, _ in g], lab))
 
     mapping = stitch_tracklets(tracklets)
+    # 카메라가 돌아간 사이 화면 밖에 있다 돌아온 선수는 자동으로 잇기엔 불확실해 '같은 선수 후보'만 남긴다
+    merge_hints: Dict[str, List[str]] = {}
+    try:
+        def at_edge(pt) -> bool:
+            raw = pt.payload[3] if isinstance(pt.payload, tuple) and len(pt.payload) > 3 else pt.box
+            return raw[0] < 0.03 * frame_w or raw[2] > 0.97 * frame_w
+        keys = [t.tid for t in tracklets]
+        apps = {key: (np.nanmedian(np.array(info[int(key[1:])].apps), axis=0) if info[int(key[1:])].apps else None,
+                      len(info[int(key[1:])].apps)) for key in keys}
+        exits = {key: at_edge(tracker.history[int(key[1:])][-1]) for key in keys}
+        enters = {key: at_edge(tracker.history[int(key[1:])][0]) for key in keys}
+        hints = suggest_same_player(tracklets, mapping, apps, exits, enters, C.appearance_distance)
+        merge_hints = {"P" + h[1:]: ["P" + o[1:] for o in lst] for h, lst in hints.items()}
+    except Exception:  # 부가 정보 — 실패해도 분석 결과는 살린다
+        logger.exception("같은 선수 후보 계산 실패")
     players_obs: Dict[int, List[PlayerObs]] = defaultdict(list)
     merged_labels: Dict[str, str] = {}
     thumbs: Dict[str, Optional[bytes]] = {}
@@ -501,9 +520,13 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     ball_sel = select_ball_positions(
         ball_cands, times, frame_w, min_conf_new=getattr(detector, "ball_min_conf_new", 0.3),
         memory_s=1.5 if dedicated_ball else 1.0)
+    # 카메라가 공을 따라 돌아가는 사이 놓친 공은 화면 이동을 따라 잇는다 (화면 중심의 안정화 좌표)
+    cam_centers = [tuple((T @ np.array([frame_w / 2, frame_h / 2, 1.0]))[:2]) for T in cam_T] if cam_T else None
     ball_px = interpolate_gaps(ball_sel, times,
                                max_gap_s=2.5 if dedicated_ball else 0.8,
-                               max_speed_px_s=0.6 * frame_w if dedicated_ball else None)
+                               max_speed_px_s=0.6 * frame_w if dedicated_ball else None,
+                               cam_centers=cam_centers if dedicated_ball else None,
+                               cam_min_shift_px=0.05 * frame_w)
     frames = []
     for i, t in enumerate(times):
         b = ball_px[i]
@@ -536,6 +559,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         "removed_static": removed_static,
         "camera_moving": camera_moving,
         "snapped_colors": dict(clf.snapped_hex),
+        "merge_hints": merge_hints,
         "warnings": warnings,
     }
     colors = {pid: C.rgb_to_hex(C.lab_to_rgb(np.median(np.array(v), axis=0))[0])

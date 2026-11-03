@@ -267,3 +267,67 @@ def stitch_tracklets(tracklets: Sequence[Tracklet], max_gap_s: float = 4.0,
             head = prv[head]
         mapping[t.tid] = head
     return mapping
+
+
+# ── 화면 밖으로 나갔다 돌아온 선수 후보 ───────────────────────────────────────
+
+@dataclass
+class _Chain:
+    head: str
+    team: str
+    start: Tuple[float, float, float]
+    end: Tuple[float, float, float]
+    appearance: Optional[np.ndarray]
+    n_app: int
+    exit_edge: bool    # 마지막 조각이 화면 가장자리에서 끝났다(카메라가 돌아가며 화면 밖으로 나감)
+    enter_edge: bool   # 첫 조각이 화면 가장자리에서 시작했다
+
+
+def suggest_same_player(tracklets: Sequence[Tracklet], mapping: Dict[str, str],
+                        appearance: Dict[str, Tuple[Optional[np.ndarray], int]],
+                        exit_edge: Dict[str, bool], enter_edge: Dict[str, bool],
+                        appearance_distance: Callable[[Optional[np.ndarray], Optional[np.ndarray]], Optional[float]],
+                        k: int = 3, max_gap_s: float = 90.0, avg_speed: float = 6.0, slack_m: float = 8.0,
+                        max_app_de: float = 14.0, edge_only_gap_s: float = 12.0) -> Dict[str, List[str]]:
+    """stitch_tracklets로 이은 선수(체인)마다 '같은 사람일 수 있는' 다른 선수 후보를 k명까지 고른다.
+
+    카메라가 반대편으로 돌아간 사이 화면 밖에 있던 선수는 수십 초 뒤 새 트랙으로 나타난다. 같은 팀 상의는
+    다 같아서 머리·반바지·양말 색(appearance)과 공백 동안 갈 수 있는 거리로 후보를 매긴다.
+    자동으로 잇지 않는 이유: 경기 1(21분)에서 일부러 끊은 트랙으로 재 보니 1순위가 맞는 경우가 절반뿐이었다
+    (3순위 안에는 75~80%). 그래서 '선수 정리' 화면에서 사람이 썸네일을 보고 고르도록 후보만 준다.
+    화면 가장자리로 나가서 가장자리로 들어온 경우가 아니면 edge_only_gap_s보다 긴 공백은 후보로 두지 않는다.
+    반환: {대표 tid: [후보 대표 tid, ...]} (가까운 순)
+    """
+    groups: Dict[str, List[Tracklet]] = {}
+    for t in tracklets:
+        groups.setdefault(mapping.get(t.tid, t.tid), []).append(t)
+    chains: List[_Chain] = []
+    for head, mem in groups.items():
+        mem.sort(key=lambda t: t.start[0])
+        apps = [(appearance.get(t.tid) or (None, 0)) for t in mem]
+        vecs = [a for a, n in apps if a is not None for _ in range(min(n, 50))]
+        app = np.nanmedian(np.array(vecs), axis=0) if vecs else None
+        chains.append(_Chain(head, mem[0].team, mem[0].start, mem[-1].end, app, sum(n for _, n in apps),
+                             exit_edge.get(mem[-1].tid, False), enter_edge.get(mem[0].tid, False)))
+
+    scored: Dict[str, List[Tuple[float, str]]] = {}
+    for a in chains:
+        for b in chains:
+            if a is b or a.team != b.team:
+                continue
+            gap = b.start[0] - a.end[0]
+            if gap <= 0 or gap > max_gap_s:
+                continue
+            if gap > edge_only_gap_s and not (a.exit_edge and b.enter_edge):
+                continue
+            dist = ((a.end[1] - b.start[1]) ** 2 + (a.end[2] - b.start[2]) ** 2) ** 0.5
+            reach = avg_speed * gap + slack_m
+            if dist > reach:
+                continue
+            d = appearance_distance(a.appearance, b.appearance)
+            if d is None or d > max_app_de:
+                continue
+            cost = d / max_app_de + 0.5 * dist / reach + 0.3 * gap / max_gap_s
+            scored.setdefault(a.head, []).append((cost, b.head))
+            scored.setdefault(b.head, []).append((cost, a.head))
+    return {h: [o for _, o in sorted(lst)[:k]] for h, lst in scored.items()}

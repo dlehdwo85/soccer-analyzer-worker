@@ -96,6 +96,7 @@ class JerseySample:
     median_lab: np.ndarray            # (3,)
     pixels_lab: np.ndarray            # (K,3) 서브샘플
     valid_fraction: float             # 잔디 제외 후 남은 비율
+    appearance: Optional[np.ndarray] = None  # (9,) 머리·반바지·양말 영역 LAB 중앙값 — 같은 팀 선수끼리 구분용
 
 
 def torso_pixels_rgb(frame_rgb: np.ndarray, box: Sequence[float]) -> np.ndarray:
@@ -173,7 +174,46 @@ def sample_jersey(frame_rgb: np.ndarray, box: Sequence[float], max_pixels: int =
     if len(valid) > max_pixels:
         valid = valid[rng.choice(len(valid), max_pixels, replace=False)]
     lab = rgb_to_lab(valid)
-    return JerseySample(median_lab=np.median(lab, axis=0), pixels_lab=lab, valid_fraction=frac)
+    return JerseySample(median_lab=np.median(lab, axis=0), pixels_lab=lab, valid_fraction=frac,
+                        appearance=body_appearance(frame_rgb, box))
+
+
+# 유니폼 상의는 팀원이 모두 같으니, 사람마다 다른 머리(머리카락·피부)·반바지·양말·축구화 색을 본다.
+APPEARANCE_BANDS = ((0.0, 0.14), (0.56, 0.76), (0.80, 1.0))
+
+
+def body_appearance(frame_rgb: np.ndarray, box: Sequence[float]) -> Optional[np.ndarray]:
+    """박스 가운데 세로 띠를 머리·반바지·양말 영역으로 나눠 잔디를 뺀 LAB 중앙값 (9,). 못 구한 영역은 NaN."""
+    h_img, w_img = frame_rgb.shape[:2]
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if h < 24:
+        return None
+    cx1, cx2 = max(0, int(round(x1 + 0.3 * w))), min(w_img, int(round(x2 - 0.3 * w)))
+    if cx2 - cx1 < 2:
+        return None
+    out = np.full(9, np.nan)
+    for i, (a, b) in enumerate(APPEARANCE_BANDS):
+        ya, yb = max(0, int(round(y1 + a * h))), min(h_img, int(round(y1 + b * h)))
+        px = frame_rgb[ya:yb, cx1:cx2].reshape(-1, 3)
+        if len(px) < 6:
+            continue
+        px = px[~grass_mask_rgb(px)]
+        if len(px) >= 4:
+            out[3 * i:3 * i + 3] = np.median(rgb_to_lab(px), axis=0)
+    return out if np.isfinite(out).any() else None
+
+
+def appearance_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """두 트랙 외형(body_appearance 중앙값)의 영역별 평균 색 거리. 비교할 영역이 없으면 None."""
+    if a is None or b is None:
+        return None
+    ds = []
+    for i in range(len(APPEARANCE_BANDS)):
+        pa, pb = a[3 * i:3 * i + 3], b[3 * i:3 * i + 3]
+        if np.isfinite(pa).all() and np.isfinite(pb).all():
+            ds.append(float(delta_e(pa, pb)[0]))
+    return float(np.mean(ds)) if ds else None
 
 
 # ── 군집화 (기준 색 보정용) ───────────────────────────────────────────────────
