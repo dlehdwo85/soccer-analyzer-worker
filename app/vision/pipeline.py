@@ -36,6 +36,7 @@ from .events import EventConfig, Frame, PlayerObs, detect_events, fit_to_extents
 from .pitch import GOAL_WIDTH, PitchMapper
 from .scoreboard import ScoreboardReader
 from .audio import detect_whistles, load_audio
+from .pitchlines import TouchlineFilter, halfway_line
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
 from .tracker import Detection, IoUTracker, Tracklet, stitch_tracklets, suggest_same_player
 
@@ -374,6 +375,9 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     calibrated_colors = False
     calib_frames = max(10, int(cfg.color_calib_s * eff_fps))
     board = ScoreboardReader(frame_w, frame_h)   # 영상에 박힌 점수 자막 → 골 시각
+    # 보정 없는 영상: 카메라 쪽 터치라인을 찾아 그 바깥(벤치·몸 푸는 사람)을 선수에서 뺀다
+    touch = None if mapper.calibrated else TouchlineFilter()
+    halfway_x: List[float] = []   # 하프라인의 경기장 x (안정화 좌표) — 경기장 가운데 찾기
     removed_outside = 0
 
     def run_tracker(k: int, frame_rgb: Optional[np.ndarray], dets: List):
@@ -414,6 +418,12 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         t = (f_idx - start_f) / fps_video
         persons, balls = detector.detect(frame_rgb)
+        if touch is not None:
+            try:
+                persons = touch.update(t, frame_rgb, persons)
+            except Exception:  # 부가 기능 — 실패하면 거르지 않는다
+                logger.exception("터치라인 인식 실패")
+                touch = None
         balls = in_play_candidates(balls, persons, frame_h)   # 벤치 옆 여분의 공·조명 같은 경기 밖 후보 제거
         try:
             board.add(t, frame_rgb)
@@ -422,6 +432,14 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
             board.failed = True
         if cam is not None:
             cam_T.append(cam.update(frame_rgb, [b for b, _ in persons]).copy())
+            if touch is not None and k % 5 == 0:
+                try:
+                    hl = halfway_line(frame_rgb)
+                    if hl is not None:
+                        gx, gy = (hl[0], hl[1]) if hl[1] > hl[3] else (hl[2], hl[3])   # 선의 아래 끝 (땅)
+                        halfway_x.append(mapper.to_pitch(*cam.point(gx, gy))[0])
+                except Exception:
+                    logger.exception("하프라인 인식 실패")
             balls = [(*cam.point(bx, by), bc) for bx, by, bc in balls]
         dets = []
         for box, conf in persons:
@@ -543,7 +561,9 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         frames.append(Frame(t, players_obs.get(i, []), bp))
 
     if cam is not None and not mapper.calibrated:
-        frames = fit_to_extents(frames, mapper.length, mapper.width)
+        # 하프라인이 충분히 잡혔으면 그 위치를 경기장 가운데로 맞춘다 (양쪽 골대 거리가 같아진다)
+        center = float(np.median(halfway_x)) if len(halfway_x) >= 20 else None
+        frames = fit_to_extents(frames, mapper.length, mapper.width, center_x=center)
     ball_seen = sum(1 for b in ball_px if b is not None) / len(times)
     if ball_seen < 0.3:
         warnings.append(f"공이 영상의 {ball_seen * 100:.0f}% 구간에서만 검출되어 볼 이벤트가 적게 잡혔을 수 있습니다.")
@@ -568,6 +588,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         "raw_tracks": len(tracker.history),
         "removed_outside_pitch": removed_outside,
         "removed_static": removed_static,
+        "removed_outside_touchline": touch.removed if touch is not None else 0,
+        "halfway_samples": len(halfway_x),
         "camera_moving": camera_moving,
         "snapped_colors": dict(clf.snapped_hex),
         "merge_hints": merge_hints,

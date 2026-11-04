@@ -493,12 +493,15 @@ def _shot_event(a: Spell, b: Optional[Spell], bi: _BallIndex, cfg: EventConfig, 
                          "xg": shot_xg(a.x1, a.y1, goal_x, goal_y, cfg.goal_width, a.s)})
 
 
-def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: float = 1.0) -> List[Frame]:
+def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: float = 1.0,
+                   center_x: Optional[float] = None) -> List[Frame]:
     """보정 없이 카메라가 움직인 영상: 선수들이 실제로 있던 범위(양 끝 q%)를 경기장 크기로 맞춘다.
 
     안정화 좌표는 첫 장면 화면 기준이라 카메라가 돈 만큼 경기장이 늘어나 있다 (경기 1: 가로 약 1.6배).
     그대로 쓰면 골대 거리·슈팅 거리가 틀려 xG가 7을 넘는 등 말이 안 되는 값이 나온다.
     좌표·점유 반경은 같이 늘리고 줄이며, 국소 축척(m/단위)은 반대로 고쳐 실제 거리는 그대로 둔다.
+    center_x(하프라인 위치)를 주면 그곳을 경기장 가운데로 두고 양쪽으로 같은 축척을 쓴다 — 선수가 한쪽 진영에
+    몰려 있던 영상에서 범위만으로 맞추면 가운데가 밀려, 한쪽 골대로만 슈팅이 잡혔다 (경기 1: 홈 0 : 원정 28).
     """
     xs = [p.x for f in frames for p in f.players]
     ys = [p.y for f in frames for p in f.players]
@@ -510,6 +513,9 @@ def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: floa
     y0, y1 = (float(v) for v in np.percentile(ys, [q, 100 - q]))
     if x1 - x0 < 1e-6 or y1 - y0 < 1e-6:
         return list(frames)
+    if center_x is not None and x0 < center_x < x1:
+        half = max(center_x - x0, x1 - center_x)
+        x0, x1 = center_x - half, center_x + half
     kx, ky = length / (x1 - x0), width / (y1 - y0)
     k = (kx + ky) / 2
     out = []

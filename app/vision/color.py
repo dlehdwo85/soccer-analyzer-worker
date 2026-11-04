@@ -287,13 +287,17 @@ class TeamColorClassifier:
         if not big:
             return {}
 
+        # 심판·골키퍼는 경기장에 한두 명뿐이라 군집이 작다 → 더 작은 군집까지 보정 후보로 (바모스전: 심판 색이
+        # 보정되지 않아 형광 노랑 심판 일부가 팀 선수로 들어갔다)
+        small = [i for i in np.argsort(-sizes) if sizes[i] >= max(3, 0.015 * len(medians))]
         snapped: Dict[str, int] = {}
         used: set = set()
         # 팀 색을 먼저(큰 군집 우선) 배정해 GK/심판이 팀 군집을 빼앗지 않게 한다.
         order = [lbl for lbl in (HOME, AWAY, REFEREE, HOME_GK, AWAY_GK) if lbl in self.reference_lab]
         for lbl in order:
             ref = self.reference_lab[lbl]
-            cands = [(float(delta_e(centers[i], ref)[0]), i) for i in big if i not in used]
+            pool = big if lbl in (HOME, AWAY) else small
+            cands = [(float(delta_e(centers[i], ref)[0]), i) for i in pool if i not in used]
             if not cands:
                 continue
             d, i = min(cands)
