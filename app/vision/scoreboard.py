@@ -19,6 +19,7 @@ import numpy as np
 BANDS = (("top", 0.0, 0.16), ("bottom", 0.86, 1.0))   # 자막이 있을 법한 화면 위·아래 띠 (높이 비율)
 FIND_SAMPLES = 45       # 처음 이만큼(초) 모아 점수판 위치를 정한다
 STATIC_FRAC = 0.9       # 이 비율 이상의 장면에서 흰색이면 '고정된 글자' 픽셀
+READABLE_FRAC = 0.5     # 점수판 후보로 인정하려면 이 비율 이상의 장면에서 콜론·숫자가 읽혀야
 HOLD_S = 20             # 바뀐 숫자 모양이 이만큼(초) 동안
 HOLD_FRAC = 0.7         # 이 비율 이상이어야 점수 변경으로 인정
 
@@ -38,14 +39,21 @@ def _components(mask: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
 
 
 def find_text_row(static: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    """고정된 흰 픽셀에서 글자처럼 생긴 조각들이 가로로 늘어선 줄을 찾아 (x0, y0, x1, y1)를 돌려준다.
-    경기장 선처럼 길고 가는 것, 너무 작은 점은 버린다."""
+    """가장 글자가 많은 줄 (x0, y0, x1, y1)."""
+    rows = find_text_rows(static)
+    return rows[0] if rows else None
+
+
+def find_text_rows(static: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """고정된 흰 픽셀에서 글자처럼 생긴 조각들이 가로로 늘어선 줄들 (글자 많은 순).
+    경기장 선처럼 길고 가는 것, 너무 작은 점은 버린다. 점수판이 아닌 고정 글자(건물 간판·방송사 표시)도
+    섞이므로, 고르는 쪽에서 콜론과 숫자가 실제로 읽히는지 확인한다."""
     h, w = static.shape
     comps = [c for c in _components(static)
              if c[4] >= 6 and 3 <= c[3] - c[1] <= 0.6 * h and c[2] - c[0] <= 0.12 * w]
     if len(comps) < 3:
-        return None
-    best = None
+        return []
+    found = []
     for c in comps:
         cy, ch = (c[1] + c[3]) / 2, c[3] - c[1]
         row = [d for d in comps if abs((d[1] + d[3]) / 2 - cy) <= 0.5 * ch and 0.5 * ch <= d[3] - d[1] <= 2 * ch]
@@ -62,13 +70,14 @@ def find_text_row(static: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
                 cur = [d]
         groups.append(cur)
         for g in groups:
-            if len(g) >= 3 and (best is None or len(g) > len(best)):
-                best = g
-    if not best:
-        return None
-    x0, y0 = min(d[0] for d in best), min(d[1] for d in best)
-    x1, y1 = max(d[2] for d in best), max(d[3] for d in best)
-    return x0, y0, x1, y1
+            if len(g) >= 3:
+                box = (min(d[0] for d in g), min(d[1] for d in g), max(d[2] for d in g), max(d[3] for d in g))
+                found.append((len(g), box))
+    out: List[Tuple[int, int, int, int]] = []
+    for _, box in sorted(found, key=lambda x: -x[0]):
+        if not any(abs(box[0] - o[0]) < 4 and abs(box[1] - o[1]) < 4 for o in out):
+            out.append(box)
+    return out
 
 
 @dataclass
@@ -113,18 +122,22 @@ class ScoreboardReader:
             if not masks:
                 continue
             static = np.stack(masks).mean(axis=0) >= STATIC_FRAC
-            row = find_text_row(static)
-            if row is None:
-                continue
-            x0, y0, x1, y1 = row
-            pad = int(round(0.6 * (y1 - y0)))
             band_y0, _ = self._band_rows(a, b)
-            bx0, bx1 = max(0, x0 - pad), min(self.frame_w, x1 + pad)
-            by0, by1 = max(0, y0 - pad), min(static.shape[0], y1 + pad)
-            self.box = (bx0, band_y0 + by0, bx1, band_y0 + by1)
-            # 위치를 찾는 동안 모은 장면도 버리지 않는다
-            self.samples = [(t, m[by0:by1, bx0:bx1]) for t, m in zip(self._find_t, masks)]
-            break
+            for x0, y0, x1, y1 in find_text_rows(static)[:8]:
+                pad = int(round(0.6 * (y1 - y0)))
+                bx0, bx1 = max(0, x0 - pad), min(self.frame_w, x1 + pad)
+                by0, by1 = max(0, y0 - pad), min(static.shape[0], y1 + pad)
+                crops = [m[by0:by1, bx0:bx1] for m in masks]
+                # 점수판이면 대부분의 장면에서 콜론과 양옆 숫자가 읽힌다 (경기 1: 오른쪽 위 다른 고정 글자를
+                # 점수판으로 잡아 없던 골 3개를 기록했다)
+                if sum(score_glyphs(c) is not None for c in crops) < READABLE_FRAC * len(crops):
+                    continue
+                self.box = (bx0, band_y0 + by0, bx1, band_y0 + by1)
+                # 위치를 찾는 동안 모은 장면도 버리지 않는다
+                self.samples = list(zip(self._find_t, crops))
+                break
+            if self.box is not None:
+                break
         else:
             self.failed = True
         self._find.clear()

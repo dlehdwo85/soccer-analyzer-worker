@@ -32,7 +32,7 @@ import numpy as np
 from . import color as C
 from .ball import in_play_candidates, interpolate_gaps, select_ball_positions
 from .camera import CameraMotion, stationary
-from .events import EventConfig, Frame, PlayerObs, detect_events, fit_to_extents
+from .events import EventConfig, Frame, PlayerObs, detect_events, find_kickoff, fit_to_extents
 from .pitch import GOAL_WIDTH, PitchMapper
 from .scoreboard import ScoreboardReader
 from .audio import detect_whistles, load_audio
@@ -597,9 +597,23 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     }
     colors = {pid: C.rgb_to_hex(C.lab_to_rgb(np.median(np.array(v), axis=0))[0])
               for pid, v in color_by_player.items() if v}
+    board_out = {"found": False}
+    try:
+        board_out = board.finish()
+    except Exception:
+        logger.exception("점수 자막 읽기 실패")
+    # 킥오프: 영상 시작과 골 뒤에 양 팀이 각자 진영에 갈라선 순간 → 공격 방향, 그리고 실점한 팀(킥오프 팀)
+    kicks = kickoffs(frames, board_out, cfg)
+    meta["kickoffs"] = kicks
+    if cfg.home_attacks == "auto" and kicks:
+        first_half = [k["home_dir"] * (-1 if cfg.halftime_s is not None and k["t"] + cfg.start_seconds >= cfg.halftime_s else 1)
+                      for k in kicks]
+        cfg.home_attacks = "right" if sum(first_half) > 0 else "left"
+        meta["attack_from_kickoff"] = True
     result = postprocess(frames, cfg, mapper.length, mapper.width, meta, merged_labels, thumbs, colors, progress)
     try:
-        result["meta"]["scoreboard"] = scoreboard_goals(board.finish(), result["events"])
+        result["meta"]["scoreboard"] = scoreboard_goals(board_out, result["events"],
+                                                        left_team=scoreboard_left_team(kicks, result["events"]))
     except Exception:
         logger.exception("점수 자막 골 판정 실패")
     try:
@@ -615,6 +629,36 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     except Exception:  # 검수용 부가 데이터 — 실패해도 분석 결과는 살린다
         logger.exception("영상 검수 오버레이 생성 실패")
     return result
+
+
+def kickoffs(frames: Sequence[Frame], board: Dict, cfg: "AnalysisConfig") -> List[Dict]:
+    """영상 시작(0~40초)과 점수 자막이 바뀐 골 뒤(−20~+120초)의 킥오프 배치."""
+    out: List[Dict] = []
+    k = find_kickoff(frames, 0.0, 40.0, min_sep=0.9)
+    if k:
+        out.append({**k, "after_goal": None})
+    for c in (board.get("changes") or []) if board.get("found") else []:
+        k = find_kickoff(frames, c["t"] - 20.0, c["t"] + 120.0, min_sep=0.85)
+        if k:
+            out.append({**k, "after_goal": c["t"], "goal_side": c["side"]})
+    return [{kk: (round(v, 2) if isinstance(v, float) else v) for kk, v in k.items()} for k in out]
+
+
+def scoreboard_left_team(kicks: Sequence[Dict], events: Sequence[Dict]) -> str:
+    """점수 자막 왼쪽이 어느 팀인가. 골 뒤 킥오프를 한 팀(킥오프 직후 처음 공을 잡은 팀)이 실점한 팀이므로
+    골을 넣은 팀은 그 반대다. 근거가 없으면 홈(관례상 왼쪽)."""
+    votes = {"home": 0, "away": 0}
+    other = {"home": "away", "away": "home"}
+    spells = sorted((e for e in events if e["kind"] == "possession"), key=lambda e: e["t"])
+    for k in kicks:
+        if k.get("after_goal") is None:
+            continue
+        sp = next((s for s in spells if k["t"] - 1.0 <= s["t"] <= k["t"] + 15.0), None)
+        if sp is None:
+            continue
+        scorer = other[sp["team"]]
+        votes[scorer if k["goal_side"] == "left" else other[scorer]] += 1
+    return "away" if votes["away"] > votes["home"] else "home"
 
 
 def whistle_restarts(events: List[Dict], whistles: Sequence[Tuple[float, float, float]], board: Dict,

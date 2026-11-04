@@ -524,3 +524,28 @@ def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: floa
         ball = ((f.ball[0] - x0) * kx, (f.ball[1] - y0) * ky) if f.ball else None
         out.append(Frame(f.t, ps, ball))
     return out
+
+
+def find_kickoff(frames: Sequence[Frame], t0: float, t1: float, min_sep: float = 0.85,
+                 min_players: int = 8) -> Optional[Dict]:
+    """t0~t1 사이에서 킥오프 순간을 찾는다: 양 팀이 가운데를 기준으로 각자 자기 진영에 갈라서 있는 장면.
+    골이 들어가면 실점한 팀이 가운데에서 다시 시작하고, 그때 모든 선수는 자기 진영에 있어야 한다.
+    반환: {t, home_dir(+1: 홈이 오른쪽으로 공격), sep(갈라선 정도 0~1), split_x}. 없으면 None.
+    가운데 위치를 몰라도 되게, 두 팀을 가장 잘 가르는 x를 그 장면에서 직접 찾는다."""
+    best = None
+    for f in frames:
+        if f.t < t0 or f.t > t1:
+            continue
+        hx = sorted(p.x for p in f.players if p.team == "home")
+        ax = sorted(p.x for p in f.players if p.team == "away")
+        if len(hx) < min_players // 2 or len(ax) < min_players // 2:
+            continue
+        xs = sorted(hx + ax)
+        for i in range(1, len(xs)):
+            split = (xs[i - 1] + xs[i]) / 2
+            h_left = sum(x < split for x in hx) / len(hx)
+            a_left = sum(x < split for x in ax) / len(ax)
+            sep = max(h_left * (1 - a_left), (1 - h_left) * a_left) ** 0.5
+            if best is None or sep > best["sep"]:
+                best = {"t": f.t, "home_dir": 1 if h_left > a_left else -1, "sep": round(sep, 3), "split_x": split}
+    return best if best and best["sep"] >= min_sep else None
