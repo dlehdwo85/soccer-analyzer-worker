@@ -388,7 +388,9 @@ def detect_set_pieces(spells: Sequence[Spell], bi: _BallIndex, cfg: EventConfig,
     for i, a in enumerate(spells):
         prev = spells[i - 1] if i else None
         still = _ball_still_before(bi, a.t0, cfg, a.s)
-        went_out = prev is not None and _went_out(bi, prev.t1, a.t0, cfg, prev.s)
+        # 경계를 못 믿으면(이동 카메라·미보정) '밖으로 나감'도 판정하지 않는다 — 화면 밖으로 사라진 공이 모두
+        # 아웃으로 잡혀 경기 1(21분)에서 세트피스가 102개나 나왔다. 이때는 공이 멈췄던 재개만 센다.
+        went_out = cfg.trust_bounds and prev is not None and _went_out(bi, prev.t1, a.t0, cfg, prev.s)
         gap = (a.t0 - prev.t1) if prev is not None else float("inf")
         if still is None and not went_out:
             continue
@@ -489,3 +491,29 @@ def _shot_event(a: Spell, b: Optional[Spell], bi: _BallIndex, cfg: EventConfig, 
                  x=a.x1, y=a.y1, x2=end[0], y2=end[1], success=outcome == "on_target",
                  detail={"outcome": outcome, "speed_ms": shot["speed_ms"],
                          "xg": shot_xg(a.x1, a.y1, goal_x, goal_y, cfg.goal_width, a.s)})
+
+
+def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: float = 1.0) -> List[Frame]:
+    """보정 없이 카메라가 움직인 영상: 선수들이 실제로 있던 범위(양 끝 q%)를 경기장 크기로 맞춘다.
+
+    안정화 좌표는 첫 장면 화면 기준이라 카메라가 돈 만큼 경기장이 늘어나 있다 (경기 1: 가로 약 1.6배).
+    그대로 쓰면 골대 거리·슈팅 거리가 틀려 xG가 7을 넘는 등 말이 안 되는 값이 나온다.
+    좌표·점유 반경은 같이 늘리고 줄이며, 국소 축척(m/단위)은 반대로 고쳐 실제 거리는 그대로 둔다.
+    """
+    xs = [p.x for f in frames for p in f.players]
+    ys = [p.y for f in frames for p in f.players]
+    if len(xs) < 50:
+        return list(frames)
+    import numpy as np
+    x0, x1 = np.percentile(xs, [q, 100 - q])
+    y0, y1 = np.percentile(ys, [q, 100 - q])
+    if x1 - x0 < 1e-6 or y1 - y0 < 1e-6:
+        return list(frames)
+    kx, ky = length / (x1 - x0), width / (y1 - y0)
+    k = (kx + ky) / 2
+    out = []
+    for f in frames:
+        ps = [PlayerObs(p.tid, p.team, (p.x - x0) * kx, (p.y - y0) * ky, p.r * k, p.s / k) for p in f.players]
+        ball = ((f.ball[0] - x0) * kx, (f.ball[1] - y0) * ky) if f.ball else None
+        out.append(Frame(f.t, ps, ball))
+    return out

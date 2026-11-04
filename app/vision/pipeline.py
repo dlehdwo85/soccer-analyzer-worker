@@ -32,7 +32,7 @@ import numpy as np
 from . import color as C
 from .ball import in_play_candidates, interpolate_gaps, select_ball_positions
 from .camera import CameraMotion, stationary
-from .events import EventConfig, Frame, PlayerObs, detect_events
+from .events import EventConfig, Frame, PlayerObs, detect_events, fit_to_extents
 from .pitch import GOAL_WIDTH, PitchMapper
 from .scoreboard import ScoreboardReader
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
@@ -541,6 +541,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         bp = mapper.to_pitch(*b) if b is not None else None
         frames.append(Frame(t, players_obs.get(i, []), bp))
 
+    if cam is not None and not mapper.calibrated:
+        frames = fit_to_extents(frames, mapper.length, mapper.width)
     ball_seen = sum(1 for b in ball_px if b is not None) / len(times)
     if ball_seen < 0.3:
         warnings.append(f"공이 영상의 {ball_seen * 100:.0f}% 구간에서만 검출되어 볼 이벤트가 적게 잡혔을 수 있습니다.")
