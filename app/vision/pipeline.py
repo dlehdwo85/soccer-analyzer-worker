@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 import numpy as np
 
 from . import color as C
-from .ball import interpolate_gaps, select_ball_positions
+from .ball import in_play_candidates, interpolate_gaps, select_ball_positions
 from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events
 from .pitch import GOAL_WIDTH, PitchMapper
@@ -413,6 +413,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         t = (f_idx - start_f) / fps_video
         persons, balls = detector.detect(frame_rgb)
+        balls = in_play_candidates(balls, persons, frame_h)   # 벤치 옆 여분의 공·조명 같은 경기 밖 후보 제거
         try:
             board.add(t, frame_rgb)
         except Exception:  # 부가 기능 — 실패해도 분석은 계속

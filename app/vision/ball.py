@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple
 
+import numpy as np
+
 BallCand = Tuple[float, float, float]   # cx, cy (px), conf
 BallPos = Optional[Tuple[float, float]]
 
@@ -53,6 +55,24 @@ def select_ball_positions(cands_per_frame: Sequence[Sequence[BallCand]], times: 
             last = (t, chosen[0], chosen[1])
         out.append(chosen)
     return remove_spikes(out, times, frame_w)
+
+
+def in_play_candidates(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[float, float, float, float], float]],
+                       frame_h: float, margin_h: float = 3.0, top_frac: float = 0.04) -> List[BallCand]:
+    """경기가 벌어지는 곳 밖의 공 후보를 버린다 (원래 화면 좌표).
+
+    야간 경기 실측(바모스전): 공 후보의 약 30%가 벤치 옆 터치라인 밖에 놓인 여분의 공, 약 25%가 화면 맨 위 조명이었다.
+    선수 발 위치의 10~90% 범위를 선수 키의 margin_h배만큼 넓힌 상자를 경기 영역으로 보고, 그 밖의 후보와
+    화면 맨 위(top_frac) 후보를 버린다. 벤치·코치 몇 명은 백분위로 걸러진다. 사람이 거의 없으면 그대로 둔다.
+    """
+    if len(persons) < 4:
+        return [b for b in balls if b[1] >= top_frac * frame_h]
+    xs = np.array([(b[0] + b[2]) / 2 for b, _ in persons])
+    ys = np.array([b[3] for b, _ in persons])
+    h = float(np.median([b[3] - b[1] for b, _ in persons]))
+    x0, x1 = np.percentile(xs, 10) - margin_h * h, np.percentile(xs, 90) + margin_h * h
+    y0, y1 = np.percentile(ys, 10) - margin_h * h, np.percentile(ys, 90) + margin_h * h
+    return [b for b in balls if x0 <= b[0] <= x1 and y0 <= b[1] <= y1 and b[1] >= top_frac * frame_h]
 
 
 def remove_spikes(pos: List[BallPos], times: Sequence[float], frame_w: float,
