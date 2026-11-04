@@ -35,6 +35,7 @@ from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events, fit_to_extents
 from .pitch import GOAL_WIDTH, PitchMapper
 from .scoreboard import ScoreboardReader
+from .audio import detect_whistles, load_audio
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
 from .tracker import Detection, IoUTracker, Tracklet, stitch_tracklets, suggest_same_player
 
@@ -580,12 +581,44 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     except Exception:
         logger.exception("점수 자막 골 판정 실패")
     try:
+        whistles = detect_whistles(load_audio(source, cfg.start_seconds, cfg.max_seconds))
+        result["meta"]["whistles"] = [[round(t, 2), round(d, 2), round(s)] for t, d, s in whistles]
+        result["events"] = whistle_restarts(result["events"], whistles, result["meta"].get("scoreboard") or {})
+    except Exception:  # 소리가 없거나 읽지 못해도 분석은 그대로
+        logger.exception("호루라기 판정 실패")
+    try:
         result["overlay"] = build_overlay(
             tracker.history, {int(k[1:]): "P" + mapping.get(k, k)[1:] for k in geo},
             ball_sel, ball_px, cam_T, frame_w, frame_h, cfg.start_seconds, stride / fps_video, len(times))
     except Exception:  # 검수용 부가 데이터 — 실패해도 분석 결과는 살린다
         logger.exception("영상 검수 오버레이 생성 실패")
     return result
+
+
+def whistle_restarts(events: List[Dict], whistles: Sequence[Tuple[float, float, float]], board: Dict,
+                     window_s: float = 25.0, dup_s: float = 3.0, kickoff_after_goal_s: float = 120.0) -> List[Dict]:
+    """호루라기 뒤 처음 공을 잡은 점유를 '재개'(파울 뒤 프리킥 등) 세트피스로 더한다.
+    골(점수 자막) 뒤 kickoff_after_goal_s 안의 첫 호루라기 재개는 킥오프로 본다. 이미 있는 세트피스와 겹치면 더하지 않는다."""
+    spells = sorted((e for e in events if e["kind"] == "possession"), key=lambda e: e["t"])
+    existing = [e["t"] for e in events if e["kind"] == "set_piece"]
+    goal_ts = sorted(g["t_board"] for g in (board.get("goals") or []))
+    used_goal = set()
+    out = list(events)
+    for wt, wd, ws in whistles:
+        end = wt + wd
+        sp = next((s for s in spells if end + 0.3 < s["t"] <= end + window_s), None)
+        if sp is None or any(abs(sp["t"] - t) <= dup_s for t in existing):
+            continue
+        g = next((gt for gt in goal_ts if gt not in used_goal and gt - 30 <= wt <= gt + kickoff_after_goal_s), None)
+        kind = "kick_off" if g is not None else "whistle"
+        if g is not None:
+            used_goal.add(g)
+        out.append({"kind": "set_piece", "t": sp["t"], "team": sp["team"], "player": sp["player"], "t_end": None,
+                    "target": None, "x": sp.get("x"), "y": sp.get("y"), "x2": None, "y2": None, "success": None,
+                    "detail": {"type": kind, "whistle_t": round(wt, 2), "whistle_strength": round(ws)}})
+        existing.append(sp["t"])
+    out.sort(key=lambda e: (e["t"], e["kind"] != "possession"))
+    return out
 
 
 def scoreboard_goals(board: Dict, events: List[Dict], left_team: str = "home", window_s: float = 60.0) -> Dict:
