@@ -65,6 +65,9 @@ class EventConfig:
     blocked_min_goal_dist: float = 6.0  # 골라인에서 이보다 먼 상대가 막으면 블록
     max_control_speed: float = 7.0      # 공이 이보다 빠르게 지나가면 '잡은 것'으로 보지 않음 (m/s)
     blip_max_s: float = 0.3             # 같은 선수 점유 사이에 끼인 이보다 짧은 상대 점유는 잡음
+    contest_max_s: float = 0.8          # 드리블 중 상대 발에 맞았지만 같은 선수가 곧바로 다시 잡으면 경합(탈취 아님)
+    contest_max_m: float = 3.0          #   그때 공이 움직인 거리 상한
+    cross_wide_m: float = 20.0          # 골문 중심에서 옆으로 이보다 먼 곳(페널티 박스 폭 밖)의 킥은 크로스 후보
     intercept_min_m: float = 4.0        # 상대가 가져갔을 때 공이 이만큼 날아갔으면 가로채기
     intercept_min_gap_s: float = 0.6    # 또는 공이 이만큼 떠 있었으면 가로채기
     # 경기장 경계를 믿을 수 있는가. 보정이 없고 카메라가 움직이면 화면 밖 = 경기장 밖이 아니므로
@@ -93,6 +96,7 @@ class Spell:
     x1: float
     y1: float
     s: float = 1.0
+    contested: int = 0      # 상대 발에 맞았지만 지켜 낸 횟수
 
     @property
     def duration(self) -> float:
@@ -247,19 +251,30 @@ def detect_spells(frames: Sequence[Frame], cfg: EventConfig) -> List[Spell]:
 
 def merge_same_player(spells: List[Spell], cfg: EventConfig) -> List[Spell]:
     # A, (짧은 B), A 형태에서 B는 공이 스친 잡음으로 보고 제거한다.
+    # B가 상대 선수이고 조금 더 길어도(contest_max_s) 공이 멀리 가지 않고 A가 곧바로 되찾았으면
+    # 드리블 중 상대 발에 맞은 것(경합)이다 — 상대 탈취·A 실수로 세지 않고 A의 점유를 이어 간다.
     cleaned: List[Spell] = []
+    contested = 0
     for i, sp in enumerate(spells):
         if 0 < i < len(spells) - 1:
             prev, nxt = spells[i - 1], spells[i + 1]
-            if (sp.duration < cfg.blip_max_s and prev.tid == nxt.tid != sp.tid
-                    and nxt.t0 - prev.t1 <= cfg.merge_same_s + cfg.blip_max_s):
-                continue
+            if prev.tid == nxt.tid != sp.tid and nxt.t0 - prev.t1 <= cfg.merge_same_s + cfg.contest_max_s:
+                if sp.duration < cfg.blip_max_s:
+                    continue
+                if (sp.team != prev.team and sp.duration < cfg.contest_max_s
+                        and _dist(prev.x1, prev.y1, nxt.x0, nxt.y0) * prev.s <= cfg.contest_max_m):
+                    contested += 1
+                    continue
+        if contested and cleaned:
+            cleaned[-1] = Spell(**{**asdict(cleaned[-1]), "contested": cleaned[-1].contested + contested})
+        contested = 0
         cleaned.append(sp)
     out: List[Spell] = []
     for sp in cleaned:
-        if out and out[-1].tid == sp.tid and sp.t0 - out[-1].t1 <= cfg.merge_same_s + cfg.blip_max_s:
+        if out and out[-1].tid == sp.tid and sp.t0 - out[-1].t1 <= cfg.merge_same_s + cfg.contest_max_s:
             prev = out[-1]
             prev.t1, prev.x1, prev.y1 = sp.t1, sp.x1, sp.y1
+            prev.contested += sp.contested
         else:
             out.append(Spell(**asdict(sp)))
     return out
@@ -416,7 +431,8 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
     for sp in spells:
         events.append(Event("possession", sp.t0, sp.team, sp.tid, t_end=sp.t1,
                             x=sp.x0, y=sp.y0, x2=sp.x1, y2=sp.y1,
-                            detail={"duration_s": round(sp.duration, 2)}))
+                            detail={"duration_s": round(sp.duration, 2),
+                                    **({"contested": sp.contested} if sp.contested else {})}))
     events.extend(detect_set_pieces(spells, bi, cfg, dirs))
 
     for i, a in enumerate(spells):
@@ -427,6 +443,9 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
 
         # 슈팅은 킥 직후 궤적만으로 판정하므로, 공이 나중에 사라져도 판정한다.
         shot = _shot_check(a, bi, cfg, direction)
+        cross = bool(shot) and _is_cross(a, b, cfg, shot)
+        if cross:
+            shot = None     # 옆에서 골문 앞으로 올린 공 — 슈팅이 아니라 패스(크로스)로 본다
         if shot:
             events.append(_shot_event(a, b, bi, cfg, shot))
             continue
@@ -458,15 +477,26 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
             events.append(Event("pass", a.t1, a.team, a.tid, t_end=b.t0, target=b.tid,
                                 x=a.x1, y=a.y1, x2=b.x0, y2=b.y0, success=True,
                                 detail={"reason": "completed", "length_m": round(travel_m, 1),
-                                        "forward": forward}))
+                                        "forward": forward, **({"cross": True} if cross else {})}))
         elif travel_m >= cfg.intercept_min_m or gap >= cfg.intercept_min_gap_s:
             events.append(Event("pass", a.t1, a.team, a.tid, t_end=b.t0, target=b.tid,
                                 x=a.x1, y=a.y1, x2=b.x0, y2=b.y0, success=False,
-                                detail={"reason": "intercepted", "length_m": round(travel_m, 1)}))
+                                detail={"reason": "intercepted", "length_m": round(travel_m, 1),
+                                        **({"cross": True} if cross else {})}))
         else:
             events.append(Event("recovery", b.t0, b.team, b.tid, target=a.tid, x=b.x0, y=b.y0))
     events.sort(key=lambda e: (e.t, e.kind != "possession"))
     return events, spells, dirs
+
+
+def _is_cross(a: Spell, b: Optional[Spell], cfg: EventConfig, shot: Dict) -> bool:
+    """빠르게 골문 쪽으로 찼어도, 페널티 박스 폭 바깥(측면)에서 찬 공이 골라인을 골문 근처로 넘지 않거나
+    (골문 앞으로 비스듬히) 같은 편이 곧바로 받았으면 크로스다."""
+    if abs(a.y1 - shot["goal_y"]) * a.s <= cfg.cross_wide_m:
+        return False
+    if shot["y_cross"] is None:
+        return True
+    return b is not None and b.team == a.team and b.t0 - a.t1 <= 2.5
 
 
 def _shot_event(a: Spell, b: Optional[Spell], bi: _BallIndex, cfg: EventConfig, shot: Dict) -> Event:
