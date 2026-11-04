@@ -25,7 +25,7 @@ import tempfile
 import requests
 import runpod
 
-from app.vision.pipeline import AnalysisConfig, analyze_video, pack_result
+from app.vision.pipeline import AnalysisConfig, analyze_video, json_default, pack_result
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
@@ -79,7 +79,7 @@ def handler(job):
         s3 = _r2_client()
         if key and s3 is not None:
             progress(99, "결과 저장 중")
-            body = gzip.compress(json.dumps(result, ensure_ascii=False, default=str).encode(), 6)
+            body = gzip.compress(json.dumps(result, ensure_ascii=False, default=json_default).encode(), 6)
             s3.put_object(Bucket=os.environ.get("R2_BUCKET", "soccer-videos"), Key=key, Body=body,
                           ContentType="application/json", ContentEncoding="gzip")
             return {"status": "done", "result_key": key, "summary": _summary(result)}

@@ -700,8 +700,17 @@ def postprocess(frames: Sequence[Frame], cfg: AnalysisConfig, length: float, wid
 
 # ── 직렬화 (RunPod 응답 크기 절감) ───────────────────────────────────────────
 
+def json_default(o):
+    """numpy 숫자·참거짓은 파이썬 값으로 (str로 바꾸면 False가 "False"라는 참 문자열이 된다)."""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
 def pack_result(result: Dict) -> str:
-    return base64.b64encode(gzip.compress(json.dumps(result, ensure_ascii=False).encode())).decode()
+    return base64.b64encode(gzip.compress(json.dumps(result, ensure_ascii=False, default=json_default).encode())).decode()
 
 
 def unpack_result(packed: str) -> Dict:

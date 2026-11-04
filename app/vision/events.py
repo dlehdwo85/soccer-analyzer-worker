@@ -505,8 +505,9 @@ def fit_to_extents(frames: Sequence[Frame], length: float, width: float, q: floa
     if len(xs) < 50:
         return list(frames)
     import numpy as np
-    x0, x1 = np.percentile(xs, [q, 100 - q])
-    y0, y1 = np.percentile(ys, [q, 100 - q])
+    # numpy 값이 섞이면 비교 결과가 numpy bool이 되어 결과 JSON 저장이 깨진다 → 파이썬 float로
+    x0, x1 = (float(v) for v in np.percentile(xs, [q, 100 - q]))
+    y0, y1 = (float(v) for v in np.percentile(ys, [q, 100 - q]))
     if x1 - x0 < 1e-6 or y1 - y0 < 1e-6:
         return list(frames)
     kx, ky = length / (x1 - x0), width / (y1 - y0)
