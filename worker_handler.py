@@ -71,7 +71,9 @@ def train_ball_job(job, inp) -> dict:
         s3.download_file(bucket, prefix + "ball_dataset.zip", data_zip)
         from train_ball import train
         runpod.serverless.progress_update(job, {"percent": 5, "message": "공 모델 학습 중"})
-        out = train(data_zip, work, epochs=int(inp.get("epochs", 60)), batch=int(inp.get("batch", 8)))
+        out = train(data_zip, work, epochs=int(inp.get("epochs", 60)), batch=int(inp.get("batch", 8)),
+                    imgsz=int(inp.get("imgsz", 1280)), mosaic=float(inp.get("mosaic", 0.3)),
+                    patience=int(inp.get("patience", 15)))
         s3.upload_file(out["onnx"], bucket, prefix + "best.onnx")
         s3.upload_file(out["pt"], bucket, prefix + "best.pt")
         metrics = {k: v for k, v in out.items() if k not in ("onnx", "pt")}
