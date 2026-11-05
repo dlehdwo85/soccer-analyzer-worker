@@ -331,3 +331,142 @@ def suggest_same_player(tracklets: Sequence[Tracklet], mapping: Dict[str, str],
             scored.setdefault(a.head, []).append((cost, b.head))
             scored.setdefault(b.head, []).append((cost, a.head))
     return {h: [o for _, o in sorted(lst)[:k]] for h, lst in scored.items()}
+
+
+# ── 팀당 정원(필드 10 + GK 1)에 맞춰 선수 칸 채우기 ─────────────────────────────
+
+@dataclass
+class RosterPiece:
+    """칸에 담을 선수 조각(이어 붙인 체인 하나)."""
+    head: str
+    team: str
+    gk: bool
+    t0: float
+    t1: float
+    p0: Tuple[float, float]          # 시작·끝 위치 (경기장 m, 또는 화면 픽셀 → pos_scale로 m 환산)
+    p1: Tuple[float, float]
+    appearance: Optional[np.ndarray]
+    lateral: float                   # 평균 옆 위치(m) — 왼쪽·오른쪽 자리
+    pos_scale: float = 1.0           # p0·p1 단위 → m
+    pos_max_gap_s: float = float("inf")  # 이보다 긴 공백에서는 위치를 비교하지 않는다(화면 좌표는 카메라가 돌면 무의미)
+
+    @property
+    def seconds(self) -> float:
+        return self.t1 - self.t0
+
+
+@dataclass
+class _Slot:
+    pieces: List[RosterPiece] = field(default_factory=list)
+    apps: List[Tuple[np.ndarray, float]] = field(default_factory=list)
+    lat_sum: Tuple[float, float] = (0.0, 0.0)
+
+    def appearance(self) -> Optional[np.ndarray]:
+        if not self.apps:
+            return None
+        return np.average(np.array([a for a, _ in self.apps]), axis=0, weights=[w for _, w in self.apps])
+
+    def lateral(self) -> float:
+        s, w = self.lat_sum
+        return s / w if w else 0.0
+
+    def add(self, p: RosterPiece) -> None:
+        self.pieces.append(p)
+        w = max(p.seconds, 0.1)
+        if p.appearance is not None and np.isfinite(p.appearance).any():
+            self.apps.append((p.appearance, w))
+        self.lat_sum = (self.lat_sum[0] + p.lateral * w, self.lat_sum[1] + w)
+
+
+def pieces_from_tracklets(tracklets: Sequence[Tracklet], mapping: Dict[str, str],
+                          appearance: Dict[str, Tuple[Optional[np.ndarray], int]],
+                          is_gk: Dict[str, bool]) -> List[RosterPiece]:
+    groups: Dict[str, List[Tracklet]] = {}
+    for t in tracklets:
+        groups.setdefault(mapping.get(t.tid, t.tid), []).append(t)
+    out = []
+    for head, mem in groups.items():
+        pts = sorted((p for t in mem for p in t.points), key=lambda p: p[0])
+        apps = [appearance.get(t.tid) or (None, 0) for t in mem]
+        vecs = [a for a, n in apps if a is not None for _ in range(min(n, 50))]
+        gk_n = sum(len(t.points) for t in mem if is_gk.get(t.tid))
+        out.append(RosterPiece(head, mem[0].team, gk_n * 2 > len(pts), pts[0][0], pts[-1][0],
+                               (pts[0][1], pts[0][2]), (pts[-1][1], pts[-1][2]),
+                               np.nanmedian(np.array(vecs), axis=0) if vecs else None,
+                               float(np.mean([p[2] for p in pts]))))
+    return out
+
+
+def assign_roster_slots(pieces: Sequence[RosterPiece],
+                        appearance_distance: Callable[[Optional[np.ndarray], Optional[np.ndarray]], Optional[float]],
+                        field_slots: int = 10, gk_slots: int = 1, min_seconds: float = 2.0,
+                        overlap_tol_s: float = 0.5, avg_speed: float = 6.0, slack_m: float = 8.0,
+                        max_app_de: float = 25.0, open_cost: float = 1.0, batch_s: float = 1.0
+                        ) -> Tuple[Dict[str, str], List[str]]:
+    """경기장 안에는 팀마다 필드 선수 10명 + GK 1명뿐이다. 선수 조각을 시간 순으로 보며 팀·역할별 정원만큼의
+    칸에 담아, 화면 밖에 나갔다 돌아와 새 번호가 붙은 사람을 '지금 비어 있는 칸'(화면 밖에 나가 있는 선수) 중
+    하나로 모은다.
+
+    - 같은 칸의 조각은 시간이 겹치면 안 된다(동시에 두 곳에 있을 수 없다).
+    - 공백 동안 평균 속도로 갈 수 있는 거리여야 한다(위치를 비교할 수 있을 때).
+    - 비용 = 머리·반바지·양말 색 차이 + 옆 위치(왼쪽·오른쪽 자리) 차이 + 이동 거리.
+    - 골키퍼를 따로 알아보지 못한 팀은 GK까지 필드 칸(10 + 1)에 담는다.
+    - 정원이 차기 전에는 잘 맞는 칸이 없으면(open_cost 초과) 새 칸을 연다. 정원이 차면 빈 칸 중 가장 나은 곳에
+      담고, 빈 칸이 없으면(동시에 정원보다 많이 보임) 정원 초과 — 팀을 잘못 본 심판·라인 밖 인원·중복 검출이다.
+    정확도 한계: 같은 유니폼이라 색 구분이 약해, 오래 화면 밖에 있던 선수는 틀리게 담길 수 있다.
+    그래서 결과는 '합치기'로 저장해 선수 정리 화면에서 되돌릴 수 있게 한다.
+    반환: ({조각 head: 칸 대표 head}, 정원 초과 head 목록)
+    """
+    out: Dict[str, str] = {}
+    extra: List[str] = []
+    for team in sorted({p.team for p in pieces}):
+        # 골키퍼를 따로 못 알아본 팀(GK 색 미지정)은 GK도 필드 칸에 들어온다
+        has_gk = any(p.gk for p in pieces if p.team == team)
+        for gk, cap in ((True, gk_slots), (False, field_slots + (0 if has_gk else gk_slots))):
+            mine = sorted((p for p in pieces if p.team == team and p.gk == gk and p.seconds >= min_seconds),
+                          key=lambda p: p.t0)
+            slots: List[_Slot] = []
+            i = 0
+            while i < len(mine):
+                j = i
+                while j < len(mine) and mine[j].t0 - mine[i].t0 <= batch_s:
+                    j += 1
+                batch, i = mine[i:j], j
+                pairs = []
+                for bi, p in enumerate(batch):
+                    for si, s in enumerate(slots):
+                        last = s.pieces[-1]
+                        if last.t1 > p.t0 + overlap_tol_s:
+                            continue
+                        gap = max(p.t0 - last.t1, 0.0)
+                        move = 0.0
+                        if gap <= min(p.pos_max_gap_s, last.pos_max_gap_s):
+                            reach = avg_speed * gap + slack_m
+                            d = float(np.hypot(last.p1[0] - p.p0[0], last.p1[1] - p.p0[1])) * p.pos_scale
+                            if d > reach:
+                                continue
+                            move = d / reach
+                        da = appearance_distance(s.appearance(), p.appearance)
+                        cost = (0.5 if da is None else min(da / max_app_de, 1.5))                             + abs(s.lateral() - p.lateral) / 15.0 + 0.5 * move
+                        pairs.append((cost, bi, si))
+                pairs.sort()
+                used_b, used_s = set(), set()
+                for cost, bi, si in pairs:
+                    if bi in used_b or si in used_s or (len(slots) < cap and cost > open_cost):
+                        continue
+                    used_b.add(bi)
+                    used_s.add(si)
+                    slots[si].add(batch[bi])
+                for bi, p in enumerate(batch):
+                    if bi in used_b:
+                        continue
+                    if len(slots) < cap:
+                        slots.append(_Slot())
+                        slots[-1].add(p)
+                    else:
+                        extra.append(p.head)
+            for s in slots:
+                lead = max(s.pieces, key=lambda q: q.seconds).head
+                for q in s.pieces:
+                    out[q.head] = lead
+    return out, extra
