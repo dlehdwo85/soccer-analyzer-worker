@@ -216,18 +216,18 @@ def appearance_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Opt
     return float(np.mean(ds)) if ds else None
 
 
-def kit_mismatch(lab: Optional[np.ndarray], team: str, refs: Dict[str, np.ndarray]) -> bool:
-    """상의 색이 자기 팀보다 상대 팀이나 심판 색에 가까운가 (팀 판정이 흔들린 조각 — 심판·상대 선수·형광 조끼 GK)."""
+KIT_MARGIN = 10.0
+
+
+def kit_mismatch(lab: Optional[np.ndarray], team: str, refs: Dict[str, np.ndarray], margin: float = KIT_MARGIN) -> bool:
+    """상의 색이 자기 팀보다 상대 팀이나 심판 색에 확실히(margin) 가까운가 — 팀을 잘못 본 조각(상대 선수·심판).
+    흐린 썸네일은 잔디가 섞여 애매하게 나오므로 여유를 둔다. 형광 조끼는 조끼 입은 같은 팀 선수일 수 있어
+    색이 진하다는 이유만으로는 빼지 않는다(경기 3: 원정 여러 명이 조끼를 입음)."""
     if lab is None or team not in refs:
         return False
-    # 무채색(검정·흰색) 팀인데 몸통이 형광처럼 진한 색이면 조끼 입은 GK·심판이다 (밤 조명에선 형광이 어둡게 찍혀
-    # 심판 기준색보다 팀 색에 더 가깝게 나오기도 한다)
-    chroma = lambda v: float(np.hypot(v[1], v[2]))
-    if chroma(lab) > 30 and chroma(refs[team]) < 20:
-        return True
     own = float(delta_e(lab, refs[team])[0])
     others = [float(delta_e(lab, v)[0]) for k, v in refs.items() if k != team]
-    return bool(others) and min(others) < own
+    return bool(others) and min(others) + margin < own
 
 
 # ── 군집화 (기준 색 보정용) ───────────────────────────────────────────────────
