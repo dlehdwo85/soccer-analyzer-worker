@@ -55,8 +55,38 @@ def _summary(result) -> dict:
             "ball_detected_pct": meta.get("ball_detected_pct"), "duration_s": meta.get("duration_s")}
 
 
+def train_ball_job(job, inp) -> dict:
+    """공 모델 추가 학습: R2의 prefix/ball_dataset.zip으로 학습하고 best.onnx·best.pt·metrics.json을 prefix에 올린다."""
+    s3 = _r2_client()
+    if s3 is None:
+        return {"status": "failed", "error": "워커에 R2 설정이 없습니다"}
+    prefix = inp.get("prefix") or ""
+    if not prefix.startswith("balltrain/") or ".." in prefix:
+        return {"status": "failed", "error": "학습 데이터 위치가 올바르지 않습니다"}
+    bucket = os.environ.get("R2_BUCKET", "soccer-videos")
+    work = tempfile.mkdtemp(prefix="balltrain_")
+    try:
+        runpod.serverless.progress_update(job, {"percent": 2, "message": "학습 데이터 받는 중"})
+        data_zip = os.path.join(work, "ball_dataset.zip")
+        s3.download_file(bucket, prefix + "ball_dataset.zip", data_zip)
+        from train_ball import train
+        runpod.serverless.progress_update(job, {"percent": 5, "message": "공 모델 학습 중"})
+        out = train(data_zip, work, epochs=int(inp.get("epochs", 60)), batch=int(inp.get("batch", 8)))
+        s3.upload_file(out["onnx"], bucket, prefix + "best.onnx")
+        s3.upload_file(out["pt"], bucket, prefix + "best.pt")
+        metrics = {k: v for k, v in out.items() if k not in ("onnx", "pt")}
+        s3.put_object(Bucket=bucket, Key=prefix + "metrics.json", Body=json.dumps(metrics).encode(),
+                      ContentType="application/json")
+        return {"status": "done", "prefix": prefix, "metrics": metrics}
+    except Exception as e:
+        logger.exception("공 모델 학습 실패")
+        return {"status": "failed", "error": str(e)}
+
+
 def handler(job):
     inp = job.get("input") or {}
+    if inp.get("mode") == "train_ball":
+        return train_ball_job(job, inp)
     url = inp.get("video_url")
     if not url:
         return {"status": "failed", "error": "video_url이 없습니다"}

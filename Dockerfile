@@ -36,6 +36,6 @@ RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_MODEL}'); YOLO('yolov8
 
 COPY app/__init__.py app/__init__.py
 COPY app/vision app/vision
-COPY worker_handler.py .
+COPY worker_handler.py train_ball.py .
 
 CMD ["python", "-u", "worker_handler.py"]
