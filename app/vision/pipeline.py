@@ -191,7 +191,10 @@ class YoloDetector:
 
     def detect(self, frame_rgb):
         classes = [0] if self.ball_model is not None else [0, 32]
-        res = self.model.predict(frame_rgb, imgsz=self.imgsz, classes=classes, conf=self.BALL_CONF,
+        # ultralytics는 numpy 이미지를 OpenCV처럼 BGR로 받는다. RGB를 그대로 넣으면 색이 뒤바뀌어
+        # 공 모델이 밤 경기 공을 거의 못 잡고 낮 경기도 덜 잡았다(검증 장면: 낮 53% → BGR로 82%).
+        frame = np.ascontiguousarray(frame_rgb[..., ::-1])
+        res = self.model.predict(frame, imgsz=self.imgsz, classes=classes, conf=self.BALL_CONF,
                                  device=self.device, verbose=False)[0]
         persons, balls = [], []
         if res.boxes is not None and len(res.boxes):
@@ -219,12 +222,12 @@ class YoloDetector:
                         for ix in range(n):
                             x0 = 0 if ix == 0 else min(int(ix * w / n - (tw - w / n) / 2), w - tw)
                             y0 = 0 if iy == 0 else min(int(iy * h / n - (th - h / n) / 2), h - th)
-                            cands += self._ball_predict(frame_rgb[y0:y0 + th, x0:x0 + tw], x0, y0)
+                            cands += self._ball_predict(frame[y0:y0 + th, x0:x0 + tw], x0, y0)
                 else:
-                    cands += self._ball_predict(frame_rgb)
+                    cands += self._ball_predict(frame)
             if roi is not None:
                 x0, y0, x1, y1 = roi
-                cands += self._ball_predict(frame_rgb[y0:y1, x0:x1], x0, y0)
+                cands += self._ball_predict(frame[y0:y1, x0:x1], x0, y0)
             # 두 번 잡힌 같은 공은 하나로 (신뢰도 높은 쪽)
             merged: List[Tuple[float, float, float]] = []
             for c in sorted(cands, key=lambda c: -c[2]):
