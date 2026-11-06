@@ -13,8 +13,9 @@ ENV PYTHONUNBUFFERED=1 \
     YOLO_MODEL=yolov8m.pt \
     YOLO_IMGSZ=1280 \
     YOLO_CONFIG_DIR=/app/.ultralytics \
-    YOLO_BALL_MODEL=/app/models/ball.onnx \
-    YOLO_BALL_IMGSZ=1280
+    YOLO_BALL_MODEL=/app/models/ball_night.onnx \
+    YOLO_BALL_IMGSZ=1920 \
+    YOLO_BALL_TILES=0
 
 RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
@@ -34,6 +35,11 @@ RUN pip install --no-cache-dir -r requirements-worker.txt \
 RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_MODEL}'); YOLO('yolov8x.pt')" \
     && mkdir -p /app/models && python fetch_ball_model.py /app/models/ball.onnx
 
+# 공 모델: 기존 모델을 우리 밤 경기(바모스 2·3쿼터, 대표님이 공 위치를 표시한 264장면)로 이어서 학습한 것.
+# 1080p 원본 크기(1920)로 학습·검출한다 — 줄이면 7~10px 밤 공이 사라진다. 화면 분할 없이 한 번에 본다.
+# 검증 장면(학습에 안 쓴 묶음)에서 진짜 공을 찾은 비율: 밤 8% → 31%, 낮 53% → 65%.
+# 파일은 워커 저장소 models/ball_night.onnx (원본·학습 데이터: R2 balltrain/20261105_2340_box32/).
+COPY models/ball_night.onnx /app/models/ball_night.onnx
 COPY app/__init__.py app/__init__.py
 COPY app/vision app/vision
 COPY worker_handler.py train_ball.py .
