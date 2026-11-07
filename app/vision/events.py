@@ -426,6 +426,11 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
     dirs = resolve_attack_direction(frames, cfg)
     spells = detect_spells(frames, cfg)
     bi = _BallIndex(frames)
+    spans: Dict[str, Tuple[float, float]] = {}
+    for f in frames:
+        for p in f.players:
+            s0 = spans.get(p.tid)
+            spans[p.tid] = (f.t, f.t) if s0 is None else (s0[0], f.t)
     events: List[Event] = []
 
     for sp in spells:
@@ -470,6 +475,8 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
                                     success=False, detail={"reason": "out"}))
             continue
 
+        if bogus_pass(a.t1, b.t0, travel_m, spans.get(a.tid), spans.get(b.tid), b.team == a.team):
+            continue   # 위치가 튄 것이거나 한 사람의 번호가 바뀐 것 — 패스·가로채기로 세지 않는다
         if b.team == a.team:
             if b.tid == a.tid or travel_m < cfg.pass_min_m:
                 continue
@@ -487,6 +494,23 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
             events.append(Event("recovery", b.t0, b.team, b.tid, target=a.tid, x=b.x0, y=b.y0))
     events.sort(key=lambda e: (e.t, e.kind != "possession"))
     return events, spells, dirs
+
+
+def bogus_pass(t: float, t_end: Optional[float], length_m: Optional[float],
+               passer_span: Optional[Tuple[float, float]], target_span: Optional[Tuple[float, float]],
+               same_team: bool) -> bool:
+    """패스로 셀 수 없는 경우 (경기 3 영상 대조로 찾음):
+    - 공 속도가 사람이 찰 수 있는 범위를 넘는다(30m/s 초과) — 카메라가 도는 순간 위치가 튄 것
+    - 같은 팀 가까운 거리에서, 주는 쪽 번호가 바로 사라지고 받는 쪽 번호가 바로 생겼다 — 한 사람의 번호가 바뀐 것"""
+    gap = max((t_end if t_end is not None else t) - t, 0.1)
+    if length_m is not None and length_m / gap > PASS_MAX_SPEED:
+        return True
+    if same_team and passer_span and target_span and gap <= 0.7 and (length_m or 0) <= 8.0:
+        return abs(passer_span[1] - t) <= 1.0 and abs(target_span[0] - (t_end or t)) <= 1.0
+    return False
+
+
+PASS_MAX_SPEED = 30.0   # m/s (강한 슈팅 ≈ 30m/s)
 
 
 def _is_cross(a: Spell, b: Optional[Spell], cfg: EventConfig, shot: Dict) -> bool:
