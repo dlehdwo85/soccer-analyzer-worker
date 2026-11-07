@@ -598,7 +598,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         "analysis_fps": round(eff_fps, 2),
         "frame_w": frame_w, "frame_h": frame_h,
         "calibrated": mapper.calibrated,
-        "ball_detected_pct": round(ball_seen * 100, 1),
+        "ball_detected_pct": round(ball_seen * 100, 1),          # 위치를 정한 장면 (앞뒤로 이어 붙인 추정 포함)
+        "ball_direct_pct": round(sum(1 for b in ball_sel if b is not None) / len(times) * 100, 1),  # 모델이 직접 잡은 장면
         "raw_tracks": len(tracker.history),
         "removed_outside_pitch": removed_outside,
         "removed_static": removed_static,
