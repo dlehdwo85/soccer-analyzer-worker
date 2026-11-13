@@ -38,7 +38,9 @@ RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_MODEL}'); YOLO('yolov8
 # 공 모델: 기존 모델을 우리 밤 경기(바모스 2·3쿼터, 대표님이 공 위치를 표시한 264장면)로 이어서 학습한 것.
 # 1080p 원본 크기(1920)로 학습·검출한다 — 줄이면 7~10px 밤 공이 사라진다. 화면 분할 없이 한 번에 본다.
 # 검증 장면(학습에 안 쓴 묶음)에서 진짜 공을 찾은 비율: 밤 8% → 31%, 낮 53% → 65%.
-# 파일은 워커 저장소 models/ball_night.onnx (원본·학습 데이터: R2 balltrain/20261105_2340_box32/).
+# 2판(2026-11-13): 1판 모델의 후보 424개를 확대해 검수한 273장면을 더해 재학습 — 찾는 비율은 비슷(밤 33%)하지만
+# 엉뚱한 곳을 공으로 잡는 장면이 44장면 중 23 → 8로 줄었다.
+# 파일은 워커 저장소 models/ball_night.onnx (원본·학습 데이터: R2 balltrain/20261113_1912_v2/).
 COPY models/ball_night.onnx /app/models/ball_night.onnx
 COPY app/__init__.py app/__init__.py
 COPY app/vision app/vision
