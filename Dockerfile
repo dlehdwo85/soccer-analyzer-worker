@@ -15,7 +15,10 @@ ENV PYTHONUNBUFFERED=1 \
     YOLO_CONFIG_DIR=/app/.ultralytics \
     YOLO_BALL_MODEL=/app/models/ball_night.onnx \
     YOLO_BALL_IMGSZ=1920 \
-    YOLO_BALL_TILES=0
+    YOLO_BALL_TILES=0 \
+    YOLO_BALL_CONF=0.15 \
+    YOLO_BALL_CONF_NEW=0.25 \
+    YOLO_BALL_GAP_S=1.5
 
 RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*

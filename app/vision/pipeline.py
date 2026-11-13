@@ -135,13 +135,20 @@ class YoloDetector:
         # 0이면 끔. GPU나 넉넉한 시간이 있을 때 YOLO_BALL_TILES=2 권장.
         self.ball_tiles = int(os.environ.get("YOLO_BALL_TILES", "0"))
         self.ball_min_conf_new = 0.3
+        self.ball_conf = self.BALL_CONF
+        self.ball_gap_s = 2.5
         self._focus: Optional[Tuple[float, float]] = None
         self._focus_age = 0
         self._frame_no = 0
         if self.ball_model is not None:
             names = self.ball_model.names
             self.ball_classes = [k for k, v in names.items() if "ball" in str(v).lower()] or list(names)
-            self.ball_min_conf_new = self.BALL_MODEL_MIN_CONF_NEW
+            # 공 모델마다 신뢰도 눈금이 달라 환경변수로 맞춘다. 밤 경기로 추가 학습한 모델은 0.15 아래 후보가 대부분
+            # 축구화라, 낮은 후보까지 받아 2.5초씩 이으면 못 찾은 장면에 틀린 위치가 들어갔다. 검증 39장면(사람 표시,
+            # 학습에 안 씀): 후보 0.05↑·시작 0.08·잇기 2.5초 → 맞음 18·틀림 21 / 0.15↑·0.25·1.5초 → 맞음 26·틀림 3·없음 10.
+            self.ball_conf = float(os.environ.get("YOLO_BALL_CONF", self.BALL_CONF))
+            self.ball_min_conf_new = float(os.environ.get("YOLO_BALL_CONF_NEW", self.BALL_MODEL_MIN_CONF_NEW))
+            self.ball_gap_s = float(os.environ.get("YOLO_BALL_GAP_S", "2.5"))
 
     @classmethod
     def for_quality(cls, quality: str = "standard") -> "YoloDetector":
@@ -156,7 +163,7 @@ class YoloDetector:
         return det
 
     def _ball_predict(self, img, x0: int = 0, y0: int = 0) -> List[Tuple[float, float, float]]:
-        rb = self.ball_model.predict(img, imgsz=self.ball_imgsz, classes=self.ball_classes, conf=self.BALL_CONF,
+        rb = self.ball_model.predict(img, imgsz=self.ball_imgsz, classes=self.ball_classes, conf=self.ball_conf,
                                      device=self.device, verbose=False)[0]
         out = []
         if rb.boxes is not None and len(rb.boxes):
@@ -257,6 +264,7 @@ class _DetectionCache:
         self._i = 0
         # 뒤 단계가 참고하는 검출기 속성은 그대로 흉내 낸다
         self.ball_min_conf_new = getattr(detector, "ball_min_conf_new", 0.3)
+        self.ball_gap_s = getattr(detector, "ball_gap_s", 2.5)
         self.ball_model = getattr(detector, "ball_model", None)
         if self._replay:
             self.ball_min_conf_new = self._meta.get("ball_min_conf_new", self.ball_min_conf_new)
@@ -564,7 +572,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     # 카메라가 공을 따라 돌아가는 사이 놓친 공은 화면 이동을 따라 잇는다 (화면 중심의 안정화 좌표)
     cam_centers = [tuple((T @ np.array([frame_w / 2, frame_h / 2, 1.0]))[:2]) for T in cam_T] if cam_T else None
     ball_px = interpolate_gaps(ball_sel, times,
-                               max_gap_s=2.5 if dedicated_ball else 0.8,
+                               max_gap_s=getattr(detector, "ball_gap_s", 2.5) if dedicated_ball else 0.8,
                                max_speed_px_s=0.6 * frame_w if dedicated_ball else None,
                                cam_centers=cam_centers if dedicated_ball else None,
                                cam_min_shift_px=0.05 * frame_w)
