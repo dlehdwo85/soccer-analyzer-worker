@@ -35,7 +35,7 @@ from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events, find_kickoff, fit_to_extents
 from .pitch import GOAL_WIDTH, POSSESSION_RADIUS_H, POSSESSION_RADIUS_M, PitchMapper
 from .pitchreg import PitchKeypointModel, PitchRegistrar
-from .situations import centre_kickoffs, find_goalkeepers, foul_player, restart_type
+from .situations import centre_kickoffs, find_goalkeepers, foul_player, home_goal_side, restart_type
 from .scoreboard import ScoreboardReader
 from .audio import detect_whistles, load_audio
 from .pitchlines import TouchlineFilter, halfway_line
@@ -627,12 +627,19 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
                 chains.setdefault(head, (tr.team, []))[1].extend(tr.points)
             for v in chains.values():
                 v[1].sort(key=lambda p: p[0])
-            gks, gk_info = find_goalkeepers(chains, length, width, halftime_s=(
-                cfg.halftime_s - cfg.start_seconds) if cfg.halftime_s is not None else None)
+            ht = (cfg.halftime_s - cfg.start_seconds) if cfg.halftime_s is not None else None
+            side = None
+            if cfg.home_attacks in ("right", "left"):
+                side = "left" if cfg.home_attacks == "right" else "right"
+            else:
+                side = home_goal_side(chains, length, halftime_s=ht)
+            gks, gk_info = find_goalkeepers(chains, length, width, halftime_s=ht, home_side=side)
             for tr in tracklets:
                 team = gks.get(mapping.get(tr.tid, tr.tid))
-                if team and labels.get(tr.tid) in (C.HOME, C.AWAY):
+                if team and labels.get(tr.tid) in (C.HOME, C.AWAY, C.HOME_GK, C.AWAY_GK):
+                    # 골키퍼 팀은 지키는 골문으로 정한다 (옷 색이 상대 팀과 비슷해도)
                     labels[tr.tid] = C.HOME_GK if team == "home" else C.AWAY_GK
+                    tr.team = team
             if gk_info:
                 gk_info["pieces"] = len(gks)
         except Exception:

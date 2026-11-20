@@ -27,9 +27,29 @@ def _box_side(x: float, y: float, length: float, width: float, pad: float = 2.0)
     return None
 
 
+def home_goal_side(chains: Dict[str, Tuple[str, List[Tuple[float, float, float]]]], length: float,
+                   halftime_s: Optional[float] = None, min_gap_m: float = 3.0) -> Optional[str]:
+    """홈팀이 지키는 골문 쪽(전반 기준). 팀마다 화면에 잡힌 동안의 평균 x를 보고, 평균이 자기 골문 쪽으로 치우친
+    팀이 그쪽을 지킨다고 본다 (공격 방향 판정과 같은 근거). 두 팀 평균 차이가 min_gap_m 미만이면 None."""
+    s = {"home": [0.0, 0], "away": [0.0, 0]}
+    for team, pts in chains.values():
+        if team not in s:
+            continue
+        for t, x, _ in pts:
+            flip = halftime_s is not None and t >= halftime_s
+            s[team][0] += (length - x) if flip else x
+            s[team][1] += 1
+    if not s["home"][1] or not s["away"][1]:
+        return None
+    hm, am = s["home"][0] / s["home"][1], s["away"][0] / s["away"][1]
+    if abs(hm - am) < min_gap_m:
+        return None
+    return "left" if hm < am else "right"
+
+
 def find_goalkeepers(chains: Dict[str, Tuple[str, List[Tuple[float, float, float]]]], length: float, width: float,
                      halftime_s: Optional[float] = None, min_frac: float = 0.8, min_s: float = 6.0,
-                     max_depth_m: float = 9.0, max_lateral_m: float = 11.0
+                     max_depth_m: float = 9.0, max_lateral_m: float = 11.0, home_side: Optional[str] = None
                      ) -> Tuple[Dict[str, str], Optional[Dict]]:
     """골키퍼는 골대 앞에 있는 사람이다. 유니폼 색이 필드 선수와 같아도 위치로 찾는다.
 
@@ -39,7 +59,11 @@ def find_goalkeepers(chains: Dict[str, Tuple[str, List[Tuple[float, float, float
     주로 있던 조각만 골키퍼다 — 박스 모서리나 코너 쪽에 서 있던 수비수를 빼기 위해서다 (2쿼터 화면 대조: 코너 근처
     7초짜리 조각이 골키퍼로 잡혔다). 같은 시간에 후보가 여럿이면 골문에 가장 가까운 한 명만 골키퍼다.
     반환: ({조각 id: 팀}, {"home_side": 'left'|'right', "evidence_s": {...}}) — 근거가 없으면 ({}, None).
-    후반(halftime_s 뒤)은 진영이 바뀐 것으로 본다."""
+    후반(halftime_s 뒤)은 진영이 바뀐 것으로 본다.
+
+    home_side(홈이 지키는 골문 쪽)를 알면 유니폼 색으로 정한 팀은 보지 않는다: 그 골문 앞에 머문 사람은 그 골문을 지키는
+    팀의 골키퍼다. 골키퍼 옷은 필드 선수와 색이 달라 상대 팀으로 분류되기 쉽다 (2쿼터 재분석: 왼쪽 골대 앞에 내내 서 있던
+    월넛 골키퍼가 어두운 옷 때문에 바모스로 분류됐고, 그 때문에 양 팀 골문을 거꾸로 판단했다)."""
     def half_sign(t: float) -> int:
         return -1 if halftime_s is not None and t >= halftime_s else 1
 
@@ -67,9 +91,17 @@ def find_goalkeepers(chains: Dict[str, Tuple[str, List[Tuple[float, float, float
                 cands.append((cid, team, side, pts[0][0], pts[-1][0], depth, lateral))
     a = evid["home"]["left"] + evid["away"]["right"]
     b = evid["home"]["right"] + evid["away"]["left"]
-    if max(a, b) < 20.0 or max(a, b) < 1.5 * min(a, b):
-        return {}, None       # 근거가 약하다 — 골키퍼를 정하지 않는다
-    own = {"home": "left", "away": "right"} if a >= b else {"home": "right", "away": "left"}
+    if home_side in ("left", "right"):
+        if a + b < 20.0:
+            return {}, None
+        own = {"home": home_side, "away": "right" if home_side == "left" else "left"}
+        by_side = {v: k for k, v in own.items()}
+        # 유니폼 색과 상관없이 그 골문을 지키는 팀으로
+        cands = [(cid, by_side[side], side, t0, t1, depth, lateral) for cid, _, side, t0, t1, depth, lateral in cands]
+    else:
+        if max(a, b) < 20.0 or max(a, b) < 1.5 * min(a, b):
+            return {}, None       # 근거가 약하다 — 골키퍼를 정하지 않는다
+        own = {"home": "left", "away": "right"} if a >= b else {"home": "right", "away": "left"}
     out: Dict[str, str] = {}
     taken: Dict[str, List[Tuple[float, float]]] = {"home": [], "away": []}
     for cid, team, side, t0, t1, depth, lateral in sorted(cands, key=lambda c: c[5]):
@@ -79,7 +111,8 @@ def find_goalkeepers(chains: Dict[str, Tuple[str, List[Tuple[float, float, float
             continue      # 같은 시간에 골문에 더 가까운 사람이 이미 골키퍼다
         taken[team].append((t0, t1))
         out[cid] = team
-    return out, {"home_side": own["home"], "evidence_s": {"same": round(a, 1), "opposite": round(b, 1)}}
+    return out, {"home_side": own["home"], "side_from": "positions" if home_side else "keepers",
+                 "evidence_s": {"same": round(a, 1), "opposite": round(b, 1)}}
 
 
 # ── 센터서클 킥오프 ──────────────────────────────────────────────────────────

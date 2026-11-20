@@ -33,6 +33,7 @@ SUM_KEYS = BALL_KEYS + PRESENCE_KEYS + ("pos_sum_x", "pos_sum_y", "pos_weight", 
 METRIC_SUM_KEYS = ("distance_m",)
 METRIC_MAX_KEYS = ("top_speed_ms",)
 MAX_PLAYER_SPEED = 10.5    # m/s — 이보다 빠른 이동은 위치가 튄 것으로 보고 거리·속도에 넣지 않는다
+TOP_SPEED_WINDOW_S = 3
 
 
 def empty_stats() -> Dict:
@@ -61,13 +62,21 @@ def presence_stats(points: Sequence[Tuple[float, float, float, float]], length: 
             b[1] += y
             b[2] += 1
         keys = sorted(sec)
+        avg = {k: (sec[k][0] / sec[k][2], sec[k][1] / sec[k][2]) for k in keys}
         for a, b in zip(keys, keys[1:]):
             if b - a != 1:
                 continue
-            d = math.hypot(sec[b][0] / sec[b][2] - sec[a][0] / sec[a][2], sec[b][1] / sec[b][2] - sec[a][1] / sec[a][2])
+            d = math.hypot(avg[b][0] - avg[a][0], avg[b][1] - avg[a][1])
             if d <= MAX_PLAYER_SPEED:
                 st["distance_m"] += d
-                st["top_speed_ms"] = max(st["top_speed_ms"], d)
+        # 최고 속도는 3초 동안 간 거리로 잰다. 1초 단위는 위치 떨림이 그대로 속도가 되어 아마추어 선수가 시속 37km로
+        # 나왔다 (2쿼터 재분석, 2026-11-20). 3초 구간이면 떨림은 3분의 1로 줄고 전력 질주는 그대로 잡힌다.
+        for a in keys:
+            b = a + TOP_SPEED_WINDOW_S
+            if b in avg and all(k in avg for k in range(a + 1, b)):
+                v = math.hypot(avg[b][0] - avg[a][0], avg[b][1] - avg[a][1]) / TOP_SPEED_WINDOW_S
+                if v <= MAX_PLAYER_SPEED:
+                    st["top_speed_ms"] = max(st["top_speed_ms"], v)
     st["first_seen_s"], st["last_seen_s"] = pts[0][0], pts[-1][0]
     for (t0, x0, y0, _), (t1, x1, y1, _) in zip(pts, pts[1:]):
         dt = t1 - t0
