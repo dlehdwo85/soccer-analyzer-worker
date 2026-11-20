@@ -33,6 +33,13 @@ class PlayerObs:
     y: float
     r: float           # 점유 반경 (경기장 좌표 단위)
     s: float = 1.0     # 국소 축척 (m / 좌표 단위)
+    # 화면에서의 발 위치와 점유 반경(픽셀). 경기장 선 자동 인식으로 위치를 구한 영상에서만 채운다.
+    # 낮은 각도의 카메라는 화면 세로 1픽셀이 경기장에서 수십 cm라, 살짝 뜬 공이나 박스 아래 끝의 떨림만으로도
+    # 경기장 좌표에서는 공이 선수에게서 몇 m 떨어져 보인다. 그래서 '공이 발밑에 있는가'는 화면에서 재고,
+    # 패스 길이·슈팅 위치·세트피스 위치는 경기장 좌표로 잰다.
+    ix: Optional[float] = None
+    iy: Optional[float] = None
+    ir: Optional[float] = None
 
 
 @dataclass
@@ -40,6 +47,7 @@ class Frame:
     t: float
     players: List[PlayerObs]
     ball: Optional[Tuple[float, float]] = None
+    ball_i: Optional[Tuple[float, float]] = None     # 공의 화면 위치(픽셀) — PlayerObs.ix/iy와 같은 화면 좌표
 
 
 @dataclass
@@ -73,6 +81,10 @@ class EventConfig:
     # 경기장 경계를 믿을 수 있는가. 보정이 없고 카메라가 움직이면 화면 밖 = 경기장 밖이 아니므로
     # '아웃'으로 단정하지 않는다 (공이 시야에서 벗어난 것뿐일 수 있다).
     trust_bounds: bool = True
+    out_margin_m: float = 1.0           # 공이 선 밖으로 이만큼 넘어가야 아웃 (자동 선 인식은 오차가 있어 더 크게 잡는다)
+    # 자동 선 인식: 높이 뜬 공은 바닥 위치로 옮기면 선 밖으로 나간 것처럼 보인다. 진짜 아웃은 선 근처에서 다시 시작하므로
+    # (드로잉·코너킥·골킥) 다음 점유가 선에서 이 거리 안에서 시작할 때만 아웃으로 본다. None이면 확인하지 않는다.
+    out_restart_within_m: Optional[float] = None
     # 세트피스(재개) 판정
     calibrated: bool = False            # 경기장 보정이 있어야 코너킥·골킥·스로인·프리킥을 위치로 구분한다
     still_s: float = 1.2                # 재개 전 공이 이만큼 멈춰 있어야 한다
@@ -164,6 +176,18 @@ def attack_dir(dirs: Dict[str, Dict[str, int]], team: str, t: float, cfg: EventC
 
 # ── 1) 점유 구간 ─────────────────────────────────────────────────────────────
 
+def _closeness(p: PlayerObs, f: Frame) -> float:
+    """공이 선수 점유 반경의 몇 배 거리에 있는가 (1 이하면 반경 안). 화면 좌표가 있으면 화면에서 잰다."""
+    if p.ix is not None and p.ir and f.ball_i is not None:
+        return _dist(p.ix, p.iy, f.ball_i[0], f.ball_i[1]) / p.ir
+    return _dist(p.x, p.y, f.ball[0], f.ball[1]) / max(p.r, 1e-9)
+
+
+def _near_boundary(x: float, y: float, cfg: EventConfig, s: float = 1.0) -> bool:
+    m = cfg.out_restart_within_m
+    return m is None or min(x, cfg.length - x, y, cfg.width - y) * s <= m
+
+
 def _controlled(t0: float, start: Tuple[float, float], t: float, bx: float, by: float,
                 s: float, cfg: EventConfig) -> bool:
     """확인 구간 동안 공이 느리게 움직였는가 — 빠르게 스쳐 지나간 공은 점유가 아니다."""
@@ -205,9 +229,9 @@ def detect_spells(frames: Sequence[Frame], cfg: EventConfig) -> List[Spell]:
         cand: Optional[PlayerObs] = None
         best = float("inf")
         for p in f.players:
-            d = _dist(p.x, p.y, bx, by)
-            if d <= p.r and d / p.r < best:
-                best, cand = d / p.r, p
+            c = _closeness(p, f)
+            if c <= 1.0 and c < best:
+                best, cand = c, p
 
         if owner is not None:
             cur = by_id.get(owner.tid)
@@ -216,7 +240,7 @@ def detect_spells(frames: Sequence[Frame], cfg: EventConfig) -> List[Spell]:
                 pending, pend_n = None, 0
                 continue
             # 점유자가 잠깐 검출에서 빠진 경우는 시간 기준(lose_s)으로만 판단한다.
-            far = cur is not None and _dist(cur.x, cur.y, bx, by) > cfg.release_factor * cur.r
+            far = cur is not None and _closeness(cur, f) > cfg.release_factor
             if cand is None:
                 if far or f.t - own_last > cfg.lose_s:
                     close(own_last)
@@ -360,7 +384,7 @@ def shot_xg(x: float, y: float, goal_x: float, goal_y: float, goal_width_m: floa
 
 
 def _went_out(bi: _BallIndex, t0: float, t1: float, cfg: EventConfig, s: float) -> bool:
-    m = 1.0 / max(s, 1e-6)  # 1m를 좌표 단위로
+    m = cfg.out_margin_m / max(s, 1e-6)  # 좌표 단위로
     return any(x < -m or x > cfg.length + m or y < -m or y > cfg.width + m for _, x, y in bi.path(t0, t1))
 
 
@@ -405,7 +429,8 @@ def detect_set_pieces(spells: Sequence[Spell], bi: _BallIndex, cfg: EventConfig,
         still = _ball_still_before(bi, a.t0, cfg, a.s)
         # 경계를 못 믿으면(이동 카메라·미보정) '밖으로 나감'도 판정하지 않는다 — 화면 밖으로 사라진 공이 모두
         # 아웃으로 잡혀 경기 1(21분)에서 세트피스가 102개나 나왔다. 이때는 공이 멈췄던 재개만 센다.
-        went_out = cfg.trust_bounds and prev is not None and _went_out(bi, prev.t1, a.t0, cfg, prev.s)
+        went_out = (cfg.trust_bounds and prev is not None and _went_out(bi, prev.t1, a.t0, cfg, prev.s)
+                    and _near_boundary(a.x0, a.y0, cfg, a.s))
         gap = (a.t0 - prev.t1) if prev is not None else float("inf")
         if still is None and not went_out:
             continue
@@ -462,7 +487,8 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
         travel_m = _dist(a.x1, a.y1, b.x0, b.y0) * a.s if b else 0.0
         kicked = rel_speed >= cfg.kick_speed or travel_m >= 5.0
 
-        if cfg.trust_bounds and _went_out(bi, a.t1, t_next, cfg, a.s):
+        if (cfg.trust_bounds and _went_out(bi, a.t1, t_next, cfg, a.s)
+                and (b is None or gap > cfg.max_link_s or _near_boundary(b.x0, b.y0, cfg, b.s))):
             if kicked or b is None or b.team != a.team:
                 events.append(Event("pass", a.t1, a.team, a.tid, x=a.x1, y=a.y1,
                                     success=False, detail={"reason": "out"}))

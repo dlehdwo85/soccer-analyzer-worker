@@ -18,12 +18,14 @@ ENV PYTHONUNBUFFERED=1 \
     YOLO_BALL_TILES=0 \
     YOLO_BALL_CONF=0.15 \
     YOLO_BALL_CONF_NEW=0.25 \
-    YOLO_BALL_GAP_S=1.5
+    YOLO_BALL_GAP_S=1.5 \
+    YOLO_PITCH_MODEL=/app/models/pitch.pt \
+    YOLO_PITCH_EVERY=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-worker.txt fetch_ball_model.py ./
+COPY requirements-worker.txt fetch_ball_model.py fetch_pitch_model.py ./
 # GPU에서 공 모델을 돌리도록 onnxruntime을 GPU판으로 바꾼다. 최신판은 CUDA 13(1.27+)·12.8용으로 빌드돼
 # 이 이미지(CUDA 12.1·cuDNN 9)에서 CUDA를 못 써 공 검출이 CPU로 돌았다 (2026-11-03 로그) → 1.20.2로 고정하고,
 # PyTorch가 pip으로 깔아 둔 CUDA·cuDNN 라이브러리를 onnxruntime도 찾도록 라이브러리 경로에 등록한다.
@@ -37,6 +39,14 @@ RUN pip install --no-cache-dir -r requirements-worker.txt \
 # 모델 가중치를 이미지에 미리 받아 둔다 (콜드스타트 단축). 고정밀(quality=max)은 yolov8x를 쓴다.
 RUN python -c "from ultralytics import YOLO; YOLO('${YOLO_MODEL}'); YOLO('yolov8x.pt')" \
     && mkdir -p /app/models && python fetch_ball_model.py /app/models/ball.onnx
+
+# 경기장 선 자동 인식 모델 (32점 키포인트). 장면마다 화면 → 경기장(m) 변환을 구한다.
+# 2쿼터 밤 경기 시험(2026-11-15): 전 장면에서 변환은 나오지만, 방송 경기장 비율을 가정한 모델이라 미드필드 장면에서
+# 하프라인이 4~5m 어긋난다. 그래서 오차에 강한 판정에만 쓴다 — 골키퍼(자기 골문 앞에 머무는 선수), 공격 방향,
+# 경기장 밖 사람 제외, 평균 위치, 이동 거리. 코너킥·드로잉·프리킥(파울)·센터서클 킥오프처럼 선 근처 정밀도가 필요한
+# 판정은 YOLO_PITCH_PRECISE=1일 때만 켠다 (우리 구장 영상으로 모델을 다시 학습한 뒤에 켤 것).
+# 모델 파일이 없으면 분석은 예전 방식(화면 좌표 근사)으로 그대로 돈다.
+RUN python fetch_pitch_model.py /app/models/pitch.pt
 
 # 공 모델: 기존 모델을 우리 밤 경기(바모스 2·3쿼터, 대표님이 공 위치를 표시한 264장면)로 이어서 학습한 것.
 # 1080p 원본 크기(1920)로 학습·검출한다 — 줄이면 7~10px 밤 공이 사라진다. 화면 분할 없이 한 번에 본다.

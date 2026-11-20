@@ -97,6 +97,7 @@ class JerseySample:
     pixels_lab: np.ndarray            # (K,3) 서브샘플
     valid_fraction: float             # 잔디 제외 후 남은 비율
     appearance: Optional[np.ndarray] = None  # (9,) 머리·반바지·양말 영역 LAB 중앙값 — 같은 팀 선수끼리 구분용
+    neon: float = 0.0                 # 상체에서 형광 노랑·연두(심판 조끼) 픽셀 비율
 
 
 def torso_pixels_rgb(frame_rgb: np.ndarray, box: Sequence[float]) -> np.ndarray:
@@ -123,6 +124,25 @@ def grass_mask_rgb(pixels_rgb: np.ndarray) -> np.ndarray:
     sat = np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-6), 0)
     green_dominant = (g >= r) & (g >= b) & (g - np.minimum(r, b) > 18)
     return green_dominant & (sat > 0.18) & (mx > 40)
+
+
+NEON_MIN_FRACTION = 0.35   # 상체의 이만큼이 형광이면 형광 조끼로 본다
+NEON_MAX_SHARE = 0.15      # 형광 조끼가 사람 전체의 이 비율을 넘으면 심판이 아니라 한 팀(조끼 팀)이다
+
+
+def neon_fraction_rgb(pixels_rgb: np.ndarray) -> float:
+    """형광 노랑·연두(심판 조끼) 픽셀 비율. 색상 44~96도, 채도 0.43 이상, 밝기 150 이상.
+    잔디 판정(grass_mask_rgb)이 이 색을 초록으로 보고 지워 버리므로 잔디를 빼기 전에 잰다
+    (바모스전: 심판 조끼가 통째로 지워져 남은 옷깃·팔 색으로 양 팀 선수에 섞였다)."""
+    if len(pixels_rgb) == 0:
+        return 0.0
+    p = pixels_rgb.astype(np.float64)
+    r, g, b = p[:, 0], p[:, 1], p[:, 2]
+    mx, mn = p.max(axis=1), p.min(axis=1)
+    d = np.maximum(mx - mn, 1e-6)
+    hue = np.where(mx == g, 60 * (2 + (b - r) / d), np.where(mx == r, 60 * (((g - b) / d) % 6), 60 * (4 + (r - g) / d)))
+    sat = (mx - mn) / np.maximum(mx, 1e-6)
+    return float(((hue >= 44) & (hue <= 96) & (sat >= 0.43) & (mx >= 150)).mean())
 
 
 BG_DE = 14.0  # 배경 색과 이만큼 가까운 상체 픽셀은 배경으로 본다
@@ -165,17 +185,20 @@ def sample_jersey(frame_rgb: np.ndarray, box: Sequence[float], max_pixels: int =
     px = torso_pixels_rgb(frame_rgb, box)
     if len(px) < 12:
         return None
+    neon = neon_fraction_rgb(px)
     keep = ~grass_mask_rgb(px)
     valid = px[keep]
     frac = float(keep.mean()) if len(px) else 0.0
     if len(valid) < 8:
-        return None
+        if neon < NEON_MIN_FRACTION:
+            return None
+        valid = px      # 형광 조끼는 잔디로 걸러져 남는 픽셀이 없다 — 조끼 색 그대로 표본을 만든다
     valid = _remove_background(valid, background_pixels_rgb(frame_rgb, box), rng)
     if len(valid) > max_pixels:
         valid = valid[rng.choice(len(valid), max_pixels, replace=False)]
     lab = rgb_to_lab(valid)
     return JerseySample(median_lab=np.median(lab, axis=0), pixels_lab=lab, valid_fraction=frac,
-                        appearance=body_appearance(frame_rgb, box))
+                        appearance=body_appearance(frame_rgb, box), neon=neon)
 
 
 # 유니폼 상의는 팀원이 모두 같으니, 사람마다 다른 머리(머리카락·피부)·반바지·양말·축구화 색을 본다.
@@ -266,6 +289,9 @@ class TeamColorClassifier:
     reference_hex: Dict[str, str]
     reference_lab: Dict[str, np.ndarray] = field(default_factory=dict)
     snapped_hex: Dict[str, str] = field(default_factory=dict)
+    # 형광 조끼를 심판으로 본다 (경기 설정에 심판 색을 넣지 않아도). 조끼 입은 사람이 많으면(조끼 팀) 끈다.
+    neon_referee: bool = True
+    neon_share: float = 0.0
 
     def __post_init__(self):
         if not self.reference_lab:
@@ -294,6 +320,9 @@ class TeamColorClassifier:
         """
         if len(samples) < 10:
             return {}
+        self.neon_share = float(np.mean([s.neon >= NEON_MIN_FRACTION for s in samples]))
+        if self.neon_share > NEON_MAX_SHARE:
+            self.neon_referee = False
         medians = np.array([s.median_lab for s in samples])
         centers, labels = kmeans(medians, k=min(k, len(medians)))
         sizes = np.bincount(labels, minlength=len(centers))
@@ -338,6 +367,8 @@ class TeamColorClassifier:
         """반환: (라벨, 신뢰도 0-1)."""
         if sample is None or not self.reference_lab:
             return OTHER, 0.0
+        if self.neon_referee and sample.neon >= NEON_MIN_FRACTION:
+            return REFEREE, min(1.0, 0.5 + sample.neon)
         best_frac_lbl, best_frac = OTHER, 0.0
         best_med_lbl, best_med = OTHER, float("inf")
         for lbl, ref in self.reference_lab.items():

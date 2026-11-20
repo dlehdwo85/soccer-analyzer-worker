@@ -33,7 +33,9 @@ from . import color as C
 from .ball import in_play_candidates, interpolate_gaps, select_ball_positions
 from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events, find_kickoff, fit_to_extents
-from .pitch import GOAL_WIDTH, PitchMapper
+from .pitch import GOAL_WIDTH, POSSESSION_RADIUS_H, POSSESSION_RADIUS_M, PitchMapper
+from .pitchreg import PitchKeypointModel, PitchRegistrar
+from .situations import centre_kickoffs, find_goalkeepers, foul_player, restart_type
 from .scoreboard import ScoreboardReader
 from .audio import detect_whistles, load_audio
 from .pitchlines import TouchlineFilter, halfway_line
@@ -343,6 +345,58 @@ def _encode_thumb(frame_rgb: np.ndarray, box) -> Optional[bytes]:
     return buf.tobytes() if ok else None
 
 
+def _pitch_registrar(source: str, start_f: int, end_f: Optional[int], stride: int, frame_w: int, frame_h: int,
+                     length: float, width: float) -> Tuple[Optional[PitchRegistrar], Optional[str]]:
+    """경기장 선 자동 인식기. 키포인트 모델(YOLO_PITCH_MODEL)이 있거나, 같은 영상·구간의 키포인트를 저장해 둔
+    파일(ANALYSIS_CACHE_DIR의 *.pitch.pkl)이 있을 때만 만든다. 반환: (인식기, 새로 저장할 파일 경로)"""
+    path = None
+    cache_dir = os.environ.get("ANALYSIS_CACHE_DIR")
+    if cache_dir and isinstance(source, str) and os.path.exists(source):
+        base = os.path.splitext(os.path.basename(source))[0]
+        path = os.path.join(cache_dir, f"{base}_{os.path.getsize(source)}_{start_f}_{end_f or 0}_{stride}.pitch.pkl")
+        if os.path.exists(path):
+            import pickle
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            reg = PitchRegistrar(frame_w, frame_h, length, width, model=None, every=int(data.get("every", 1)))
+            for k, kps in data["kps"].items():
+                reg.add_keypoints(int(k), kps)
+            logger.info("경기장 키포인트 캐시 재생: %s (%d장면)", path, len(reg.kps))
+            return reg, None
+    model = PitchKeypointModel.from_env()
+    if model is None:
+        return None, None
+    return PitchRegistrar(frame_w, frame_h, length, width, model=model,
+                          every=int(os.environ.get("YOLO_PITCH_EVERY", "1"))), path
+
+
+def _registered_geometry(reg: PitchRegistrar, pts: Sequence, length: float, width: float, smooth_n: int,
+                         margin: float = 8.0) -> Optional[List[Tuple]]:
+    """트랙의 발 위치(박스 아래 가운데, 원본 화면 좌표)를 경기장 m로 옮긴다. 절반 넘게 경기장 밖이면 None
+    (벤치·관중·라인 밖에서 몸 푸는 사람). 장면마다 변환이 조금씩 흔들리므로 짧게 평균을 내 떨림을 줄인다.
+    반환 항목: (장면, x, y, 점유 반경 m, 축척, 화면 발 x, 화면 발 y, 화면 점유 반경 px)"""
+    raw = []
+    for p in pts:
+        b = p.payload[3] if isinstance(p.payload, tuple) and len(p.payload) > 3 else p.box
+        fx, fy = (b[0] + b[2]) / 2, b[3]
+        q = reg.to_pitch(p.frame, fx, fy)
+        if q is not None and np.isfinite(q[0]) and np.isfinite(q[1]):
+            raw.append((p.frame, q[0], q[1], fx, fy, POSSESSION_RADIUS_H * max(4.0, b[3] - b[1])))
+    if len(raw) < 3:
+        return None
+    ok = [(-margin <= r[1] <= length + margin and -margin <= r[2] <= width + margin) for r in raw]
+    if sum(ok) < 0.5 * len(raw):
+        return None
+    raw = [r for r, o in zip(raw, ok) if o]
+    h = max(0, smooth_n // 2)
+    out = []
+    for i, (f, x, y, fx, fy, fr) in enumerate(raw):
+        seg = [r for r in raw[max(0, i - h): i + h + 1] if abs(r[0] - f) <= 2 * h]
+        out.append((f, float(np.mean([r[1] for r in seg])), float(np.mean([r[2] for r in seg])),
+                    POSSESSION_RADIUS_M, 1.0, fx, fy, fr))
+    return out
+
+
 def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector] = None,
                   progress: Optional[ProgressFn] = None) -> Dict:
     import cv2
@@ -391,6 +445,14 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     touch = None if mapper.calibrated else TouchlineFilter()
     halfway_x: List[float] = []   # 하프라인의 경기장 x (안정화 좌표) — 경기장 가운데 찾기
     removed_outside = 0
+    # 경기장 선 자동 인식: 사용자가 경기장을 찍지 않아도 장면마다 화면 → 경기장(m) 변환을 구한다
+    reg, reg_cache = (None, None)
+    if not mapper.calibrated and cfg.field_type != "futsal":
+        try:
+            reg, reg_cache = _pitch_registrar(source, start_f, end_f, stride, frame_w, frame_h,
+                                              mapper.length, mapper.width)
+        except Exception:
+            logger.exception("경기장 선 인식 준비 실패")
 
     def run_tracker(k: int, frame_rgb: Optional[np.ndarray], dets: List):
         tracked = []
@@ -442,6 +504,12 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         except Exception:  # 부가 기능 — 실패해도 분석은 계속
             logger.exception("점수 자막 읽기 실패")
             board.failed = True
+        if reg is not None and reg.model is not None:
+            try:
+                reg.add(k, frame_rgb)
+            except Exception:  # 부가 기능 — 실패하면 위치는 예전 방식(화면 좌표 근사)으로
+                logger.exception("경기장 선 인식 실패")
+                reg = None
         if cam is not None:
             cam_T.append(cam.update(frame_rgb, [b for b, _ in persons]).copy())
             if touch is not None and k % 5 == 0:
@@ -493,6 +561,31 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     logger.info("검출 완료: %d프레임, %.0f초 소요", len(times), time.time() - t_started)
     progress(92, "선수 궤적 정리 및 이벤트 판정 중")
 
+    # ── 경기장 선 인식 결과: 충분히 잡혔으면 모든 위치를 경기장 m로 계산한다 ────────────
+    reg_info: Optional[Dict] = None
+    if reg is not None:
+        try:
+            if reg_cache and reg.kps:
+                import pickle
+                with open(reg_cache, "wb") as f:
+                    pickle.dump({"every": reg.every, "kps": reg.kps}, f)
+            reg_info = reg.finish(cam_T, times)
+            reg_info["used"] = reg_info["covered_pct"] >= 60.0 and reg_info["anchors"] >= 20
+            logger.info("경기장 선 인식: %s", reg_info)
+        except Exception:
+            logger.exception("경기장 선 인식 정리 실패")
+            reg_info = None
+    registered = bool(reg_info and reg_info.get("used"))
+    # 정밀 단계: 선 인식 위치를 '경기장 지정'과 같은 수준으로 믿고 코너킥·드로잉·프리킥(파울)·센터서클 킥오프까지 위치로
+    # 판정한다. 공개 키포인트 모델은 방송 경기장 비율을 가정해, 우리 구장 미드필드 장면에서 하프라인이 4~5m 어긋났다
+    # (2026-11-15, 2쿼터 화면에 도면을 겹쳐 확인). 그 오차로는 선 근처 판정이 틀리므로 기본은 끄고, 오차에 강한 것만 쓴다:
+    # 골키퍼(박스 안에 머무는 선수), 공격 방향, 경기장 밖 사람 제외, 평균 위치, 이동 거리.
+    precise = registered and os.environ.get("YOLO_PITCH_PRECISE", "0") == "1"
+    if reg_info is not None:
+        reg_info["precise"] = precise
+    length, width = (reg.length, reg.width) if registered else (mapper.length, mapper.width)
+    smooth_n = max(1, int(round(0.4 * eff_fps)) | 1)
+
     # ── 트랙 → 팀 확정, 경기장 좌표 ───────────────────────────────────────────
     tracklets: List[Tracklet] = []
     labels: Dict[str, str] = {}
@@ -508,16 +601,42 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
             removed_static += 1
             continue  # 오래 제자리에 있는 사람 — 관중·벤치
         key = f"T{tid}"
+        if registered:
+            g = _registered_geometry(reg, pts, length, width, smooth_n)
+            if g is None:
+                removed_outside += 1
+                continue  # 경기장 밖에 있던 사람 (벤치·관중·라인 밖에서 몸 푸는 사람)
+        else:
+            g = []
+            for p in pts:
+                x, y, r, s = mapper.player_geometry(p.box)
+                g.append((p.frame, x, y, r, s))
         labels[key] = lbl
-        g = []
-        for p in pts:
-            x, y, r, s = mapper.player_geometry(p.box)
-            g.append((p.frame, x, y, r, s))
         geo[key] = g
         lab = np.median(np.array(info[tid].labs), axis=0) if info[tid].labs else None
-        tracklets.append(Tracklet(key, C.TEAM_OF_LABEL[lbl], [(times[f], x, y) for f, x, y, _, _ in g], lab))
+        tracklets.append(Tracklet(key, C.TEAM_OF_LABEL[lbl], [(times[q[0]], q[1], q[2]) for q in g], lab))
 
     mapping = stitch_tracklets(tracklets)
+    # 골키퍼: 유니폼 색이 필드 선수와 같아도, 화면에 잡힌 동안 내내 자기 골문 앞 박스에 있던 선수다
+    gk_info: Optional[Dict] = None
+    if registered:
+        try:
+            chains: Dict[str, Tuple[str, List[Tuple[float, float, float]]]] = {}
+            for tr in tracklets:
+                head = mapping.get(tr.tid, tr.tid)
+                chains.setdefault(head, (tr.team, []))[1].extend(tr.points)
+            for v in chains.values():
+                v[1].sort(key=lambda p: p[0])
+            gks, gk_info = find_goalkeepers(chains, length, width, halftime_s=(
+                cfg.halftime_s - cfg.start_seconds) if cfg.halftime_s is not None else None)
+            for tr in tracklets:
+                team = gks.get(mapping.get(tr.tid, tr.tid))
+                if team and labels.get(tr.tid) in (C.HOME, C.AWAY):
+                    labels[tr.tid] = C.HOME_GK if team == "home" else C.AWAY_GK
+            if gk_info:
+                gk_info["pieces"] = len(gks)
+        except Exception:
+            logger.exception("골키퍼 찾기 실패")
     # 카메라가 돌아간 사이 화면 밖에 있다 돌아온 선수는 자동으로 잇기엔 불확실해 '같은 선수 후보'만 남긴다
     merge_hints: Dict[str, List[str]] = {}
     try:
@@ -552,8 +671,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         pid = "P" + mapping.get(key, key)[1:]
         merged_labels.setdefault(pid, labels[key])
         team = C.TEAM_OF_LABEL[labels[key]]
-        for f, x, y, r, s in g:
-            players_obs[f].append(PlayerObs(pid, team, x, y, r, s))
+        for q in g:
+            players_obs[q[0]].append(PlayerObs(pid, team, *q[1:]))
         tid = int(key[1:])
         if info[tid].thumb and info[tid].best_area > thumb_area.get(pid, 0):
             thumbs[pid], thumb_area[pid] = info[tid].thumb, info[tid].best_area
@@ -579,18 +698,31 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     frames = []
     for i, t in enumerate(times):
         b = ball_px[i]
+        if registered:
+            bp = bi = None
+            if b is not None:
+                # 공 위치는 안정화 좌표라 그 장면의 원래 화면 좌표로 되돌린 뒤 경기장으로 옮긴다
+                q = np.linalg.inv(cam_T[i]) @ np.array([b[0], b[1], 1.0]) if i < len(cam_T) else (b[0], b[1], 1.0)
+                bi = (float(q[0] / q[2]), float(q[1] / q[2]))
+                bp = reg.to_pitch(i, bi[0], bi[1])
+                if bp is not None and not (-15 <= bp[0] <= length + 15 and -15 <= bp[1] <= width + 15):
+                    bp = None      # 높이 뜬 공·잘못 잡은 점 — 경기장에서 한참 벗어난 위치는 버린다
+            frames.append(Frame(t, players_obs.get(i, []), bp, bi if bp is not None else None))
+            continue
         bp = mapper.to_pitch(*b) if b is not None else None
         frames.append(Frame(t, players_obs.get(i, []), bp))
 
-    if cam is not None and not mapper.calibrated:
+    if cam is not None and not mapper.calibrated and not registered:
         # 하프라인이 충분히 잡혔으면 그 위치를 경기장 가운데로 맞춘다 (양쪽 골대 거리가 같아진다)
         center = float(np.median(halfway_x)) if len(halfway_x) >= 20 else None
-        frames = fit_to_extents(frames, mapper.length, mapper.width, center_x=center)
+        frames = fit_to_extents(frames, length, width, center_x=center)
     ball_seen = sum(1 for b in ball_px if b is not None) / len(times)
     if ball_seen < 0.3:
         warnings.append(f"공이 영상의 {ball_seen * 100:.0f}% 구간에서만 검출되어 볼 이벤트가 적게 잡혔을 수 있습니다.")
     camera_moving = cam is not None and cam.travel() > 0.3 * frame_w
-    if camera_moving:
+    if precise:
+        pass    # 경기장 선으로 위치를 정밀하게 계산했다 — 카메라가 움직여도 위치·슈팅·세트피스 판정을 쓴다
+    elif camera_moving:
         warnings.append("카메라가 움직이는 영상입니다. 화면 이동을 보정해 추적했지만 공격 방향·슈팅 위치 판정은 "
                         "부정확할 수 있으니 '이벤트 검수'에서 슈팅을 확인해 주세요.")
     elif not mapper.calibrated:
@@ -605,7 +737,11 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         "fps_video": round(fps_video, 2),
         "analysis_fps": round(eff_fps, 2),
         "frame_w": frame_w, "frame_h": frame_h,
-        "calibrated": mapper.calibrated,
+        "calibrated": mapper.calibrated or precise,
+        "auto_calibrated": registered,          # 경기장 선 자동 인식으로 위치(m)를 계산함 (사용자 지정 없음, 오차 몇 m)
+        "metric_positions": mapper.calibrated or registered,
+        "registration": reg_info,
+        "goalkeepers": gk_info,
         "ball_detected_pct": round(ball_seen * 100, 1),          # 위치를 정한 장면 (앞뒤로 이어 붙인 추정 포함)
         "ball_direct_pct": round(sum(1 for b in ball_sel if b is not None) / len(times) * 100, 1),  # 모델이 직접 잡은 장면
         "raw_tracks": len(tracker.history),
@@ -628,23 +764,36 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     except Exception:
         logger.exception("점수 자막 읽기 실패")
     # 킥오프: 영상 시작과 골 뒤에 양 팀이 각자 진영에 갈라선 순간 → 공격 방향, 그리고 실점한 팀(킥오프 팀)
-    kicks = kickoffs(frames, board_out, cfg)
+    kicks = kickoffs(frames, board_out, cfg, pitch=(length, width) if precise else None)
     meta["kickoffs"] = kicks
-    if cfg.home_attacks == "auto" and kicks:
+    if cfg.home_attacks == "auto" and gk_info and cfg.halftime_s is None:
+        # 골키퍼가 지키는 골문이 가장 확실한 근거다: 홈 골키퍼가 왼쪽 골문이면 홈은 오른쪽으로 공격한다
+        cfg.home_attacks = "right" if gk_info["home_side"] == "left" else "left"
+        meta["attack_from_goalkeeper"] = True
+    elif cfg.home_attacks == "auto" and kicks:
         first_half = [k["home_dir"] * (-1 if cfg.halftime_s is not None and k["t"] + cfg.start_seconds >= cfg.halftime_s else 1)
                       for k in kicks]
         cfg.home_attacks = "right" if sum(first_half) > 0 else "left"
         meta["attack_from_kickoff"] = True
-    result = postprocess(frames, cfg, mapper.length, mapper.width, meta, merged_labels, thumbs, colors, progress)
+    result = postprocess(frames, cfg, length, width, meta, merged_labels, thumbs, colors, progress)
     try:
         result["meta"]["scoreboard"] = scoreboard_goals(board_out, result["events"],
                                                         left_team=scoreboard_left_team(kicks, result["events"]))
+        if precise and not result["meta"]["scoreboard"].get("found"):
+            # 점수 자막이 없는 영상: 경기 도중의 센터서클 킥오프로 골을 찾는다
+            result["meta"]["scoreboard"] = goals_from_kickoffs(kicks, result["events"])
+            result["meta"]["kickoffs"] = kicks
     except Exception:
         logger.exception("점수 자막 골 판정 실패")
     try:
         whistles = detect_whistles(load_audio(source, cfg.start_seconds, cfg.max_seconds))
         result["meta"]["whistles"] = [[round(t, 2), round(d, 2), round(s)] for t, d, s in whistles]
-        result["events"] = whistle_restarts(result["events"], whistles, result["meta"].get("scoreboard") or {})
+        result["events"] = whistle_restarts(result["events"], whistles, result["meta"].get("scoreboard") or {},
+                                            frames=frames if precise else None,
+                                            pitch=(length, width) if precise else None,
+                                            attack=result["meta"].get("attack"),
+                                            halftime_s=(cfg.halftime_s - cfg.start_seconds)
+                                            if cfg.halftime_s is not None else None)
     except Exception:  # 소리가 없거나 읽지 못해도 분석은 그대로
         logger.exception("호루라기 판정 실패")
     try:
@@ -656,17 +805,61 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     return result
 
 
-def kickoffs(frames: Sequence[Frame], board: Dict, cfg: "AnalysisConfig") -> List[Dict]:
-    """영상 시작(0~40초)과 점수 자막이 바뀐 골 뒤(−20~+120초)의 킥오프 배치."""
+def kickoffs(frames: Sequence[Frame], board: Dict, cfg: "AnalysisConfig",
+             pitch: Optional[Tuple[float, float]] = None) -> List[Dict]:
+    """영상 시작(0~40초)과 점수 자막이 바뀐 골 뒤(−20~+120초)의 킥오프 배치.
+    pitch(경기장 길이·폭)가 있으면 위치를 미터로 아는 것이므로, 공이 센터 스폿에 놓이고 양 팀이 하프라인으로 갈라선
+    진짜 킥오프를 먼저 찾는다. 점수 자막과 짝이 없는 경기 도중 킥오프는 video_only로 남긴다(자막 없는 영상의 골 근거)."""
     out: List[Dict] = []
-    k = find_kickoff(frames, 0.0, 40.0, min_sep=0.9)
-    if k:
-        out.append({**k, "after_goal": None})
+    centre = centre_kickoffs(frames, *pitch) if pitch else []
+    used: set = set()
+    first = next((i for i, k in enumerate(centre) if k["t"] <= 60.0), None)
+    if first is not None:
+        used.add(first)
+        out.append({**centre[first], "after_goal": None, "by": "centre"})
+    else:
+        k = find_kickoff(frames, 0.0, 40.0, min_sep=0.9)
+        if k:
+            out.append({**k, "after_goal": None})
     for c in (board.get("changes") or []) if board.get("found") else []:
+        i = next((i for i, k in enumerate(centre) if i not in used and c["t"] - 20.0 <= k["t"] <= c["t"] + 150.0), None)
+        if i is not None:
+            used.add(i)
+            out.append({**centre[i], "after_goal": c["t"], "goal_side": c["side"], "by": "centre"})
+            continue
         k = find_kickoff(frames, c["t"] - 20.0, c["t"] + 120.0, min_sep=0.85)
         if k:
             out.append({**k, "after_goal": c["t"], "goal_side": c["side"]})
+    for i, k in enumerate(centre):
+        if i not in used and k["t"] > 60.0:
+            out.append({**k, "after_goal": None, "video_only": True, "by": "centre"})
     return [{kk: (round(v, 2) if isinstance(v, float) else v) for kk, v in k.items()} for k in out]
+
+
+def goals_from_kickoffs(kicks: List[Dict], events: Sequence[Dict], window_s: float = 150.0) -> Dict:
+    """점수 자막이 없을 때: 경기 도중 센터서클 킥오프마다 그 직전에 골이 있었다고 본다.
+    킥오프를 한(직후 처음 공을 잡은) 팀이 실점한 팀이고, 넣은 팀의 마지막 슈팅을 득점 장면으로 붙인다."""
+    other = {"home": "away", "away": "home"}
+    spells = sorted((e for e in events if e["kind"] == "possession"), key=lambda e: e["t"])
+    goals = []
+    for k in kicks:
+        if not k.get("video_only"):
+            continue
+        sp = next((s for s in spells if k["t"] - 1.0 <= s["t"] <= k["t"] + 15.0), None)
+        if sp is None:
+            continue
+        team = other[sp["team"]]
+        t_ref = k.get("t0", k["t"])
+        shots = [e for e in events if e["kind"] == "shot" and e["team"] == team and t_ref - window_s <= e["t"] <= t_ref]
+        shot = max(shots, key=lambda e: e["t"]) if shots else None
+        tb = round(max(0.0, t_ref - 1.0), 2)
+        k["after_goal"] = tb       # 결과 조회 때 '킥오프로 확인된 골'로 짝지어진다
+        goals.append({"t_board": tb, "team": team, "side": None, "source": "video",
+                      "t": shot["t"] if shot else tb, "player": shot["player"] if shot else None})
+    if not goals:
+        return {"found": False}
+    score = {"home": sum(g["team"] == "home" for g in goals), "away": sum(g["team"] == "away" for g in goals)}
+    return {"found": True, "source": "video", "goals": goals, "score": score}
 
 
 def scoreboard_left_team(kicks: Sequence[Dict], events: Sequence[Dict]) -> str:
@@ -687,27 +880,64 @@ def scoreboard_left_team(kicks: Sequence[Dict], events: Sequence[Dict]) -> str:
 
 
 def whistle_restarts(events: List[Dict], whistles: Sequence[Tuple[float, float, float]], board: Dict,
-                     window_s: float = 25.0, dup_s: float = 3.0, kickoff_after_goal_s: float = 120.0) -> List[Dict]:
+                     window_s: float = 25.0, dup_s: float = 3.0, kickoff_after_goal_s: float = 120.0,
+                     frames: Optional[Sequence[Frame]] = None, pitch: Optional[Tuple[float, float]] = None,
+                     attack: Optional[Dict] = None, halftime_s: Optional[float] = None) -> List[Dict]:
     """호루라기 뒤 처음 공을 잡은 점유를 '재개'(파울 뒤 프리킥 등) 세트피스로 더한다.
-    골(점수 자막) 뒤 kickoff_after_goal_s 안의 첫 호루라기 재개는 킥오프로 본다. 이미 있는 세트피스와 겹치면 더하지 않는다."""
+    골(점수 자막) 뒤 kickoff_after_goal_s 안의 첫 호루라기 재개는 킥오프로 본다. 이미 있는 세트피스와 겹치면 더하지 않고
+    그 세트피스에 호루라기 시각만 붙인다.
+
+    pitch(경기장 길이·폭)가 있으면 위치를 미터로 아는 것이므로 재개 위치로 종류를 나눈다: 코너킥·드로잉·골킥·킥오프,
+    그 밖의 경기장 안 재개는 프리킥(페널티 스폿이면 페널티킥)이고, 이때 재개하지 않은 쪽이 파울(또는 오프사이드)을
+    한 것이다. 호루라기 직전 공에 가장 가까웠던 그 팀 선수를 파울한 선수로 추정해 target에 적는다."""
+    other = {"home": "away", "away": "home"}
     spells = sorted((e for e in events if e["kind"] == "possession"), key=lambda e: e["t"])
-    existing = [e["t"] for e in events if e["kind"] == "set_piece"]
+    existing = [e for e in events if e["kind"] == "set_piece"]
     goal_ts = sorted(g["t_board"] for g in (board.get("goals") or []))
     used_goal = set()
     out = list(events)
+
+    def typed(sp: Dict, wt: float, detail: Dict) -> Tuple[Dict, Optional[str]]:
+        """위치로 재개 종류를 정하고, 프리킥·페널티킥이면 파울 정보를 붙인다. 반환: (detail, 파울한 선수)"""
+        if pitch is None or sp.get("x") is None or sp.get("y") is None:
+            return detail, None
+        half = "second" if halftime_s is not None and sp["t"] >= halftime_s else "first"
+        d = ((attack or {}).get(half) or {}).get(sp["team"])
+        own_goal_x = None if d is None else (0.0 if d > 0 else pitch[0])
+        detail["type"] = restart_type(sp["x"], sp["y"], pitch[0], pitch[1], own_goal_x)
+        if detail["type"] in ("free_kick", "penalty"):
+            detail["foul"] = True
+            return detail, (foul_player(frames, wt, other[sp["team"]]) if frames is not None else None)
+        return detail, None
+
     for wt, wd, ws in whistles:
         end = wt + wd
         sp = next((s for s in spells if end + 0.3 < s["t"] <= end + window_s), None)
-        if sp is None or any(abs(sp["t"] - t) <= dup_s for t in existing):
+        if sp is None:
+            continue
+        dup = next((e for e in existing if abs(sp["t"] - e["t"]) <= dup_s), None)
+        if dup is not None:
+            d = dup["detail"] = dict(dup.get("detail") or {})
+            if d.get("whistle_t") is None:
+                d["whistle_t"], d["whistle_strength"] = round(wt, 2), round(ws)
+                if d.get("type") in ("free_kick", "penalty") and pitch is not None:
+                    d["foul"] = True
+                    if dup.get("target") is None and frames is not None:
+                        dup["target"] = foul_player(frames, wt, other[sp["team"]])
             continue
         g = next((gt for gt in goal_ts if gt not in used_goal and gt - 30 <= wt <= gt + kickoff_after_goal_s), None)
-        kind = "kick_off" if g is not None else "whistle"
+        detail = {"type": "kick_off" if g is not None else "whistle",
+                  "whistle_t": round(wt, 2), "whistle_strength": round(ws)}
+        target = None
         if g is not None:
             used_goal.add(g)
-        out.append({"kind": "set_piece", "t": sp["t"], "team": sp["team"], "player": sp["player"], "t_end": None,
-                    "target": None, "x": sp.get("x"), "y": sp.get("y"), "x2": None, "y2": None, "success": None,
-                    "detail": {"type": kind, "whistle_t": round(wt, 2), "whistle_strength": round(ws)}})
-        existing.append(sp["t"])
+        else:
+            detail, target = typed(sp, wt, detail)
+        ev = {"kind": "set_piece", "t": sp["t"], "team": sp["team"], "player": sp["player"], "t_end": None,
+              "target": target, "x": sp.get("x"), "y": sp.get("y"), "x2": None, "y2": None, "success": None,
+              "detail": detail}
+        out.append(ev)
+        existing.append(ev)
     out.sort(key=lambda e: (e["t"], e["kind"] != "possession"))
     return out
 
@@ -804,8 +1034,12 @@ def postprocess(frames: Sequence[Frame], cfg: AnalysisConfig, length: float, wid
     ecfg = cfg.event_config(length, width, calibrated=calibrated)
     # 보정 없이 카메라까지 움직이면 화면 가장자리가 경기장 경계가 아니다 → '아웃' 판정을 끈다.
     ecfg.trust_bounds = calibrated or not meta.get("camera_moving", False)
+    if meta.get("auto_calibrated"):
+        ecfg.out_margin_m = 2.5
+        ecfg.out_restart_within_m = 7.0
     events, spells, dirs = detect_events(frames, ecfg)
-    ps = compute_player_stats(frames, events, length, width)
+    ps = compute_player_stats(frames, events, length, width,
+                              metric=calibrated or bool(meta.get("metric_positions")))
     progress(97, "통계 집계 중")
     duration = meta.get("duration_s") or (frames[-1].t if frames else 0)
 
