@@ -82,8 +82,9 @@ def train_ball_job(job, inp) -> dict:
                     imgsz=int(inp.get("imgsz", 1280)), mosaic=float(inp.get("mosaic", 0.3)),
                     patience=int(inp.get("patience", 15)), base=base, lr0=float(inp.get("lr0", 0.002)),
                     cos_lr=bool(inp.get("cos_lr", False)), scale=float(inp.get("scale", 0.2)))
-        s3.upload_file(out["onnx"], bucket, prefix + "best.onnx")
-        s3.upload_file(out["pt"], bucket, prefix + "best.pt")
+        s3.upload_file(out["pt"], bucket, prefix + "best.pt")   # 변환이 실패해도 학습 결과는 남긴다
+        if out.get("onnx"):
+            s3.upload_file(out["onnx"], bucket, prefix + "best.onnx")
         metrics = {k: v for k, v in out.items() if k not in ("onnx", "pt")}
         s3.put_object(Bucket=bucket, Key=prefix + "metrics.json", Body=json.dumps(metrics).encode(),
                       ContentType="application/json")

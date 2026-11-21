@@ -57,11 +57,17 @@ def train(data_zip: str, work: str, epochs: int = 60, batch: int = 8, imgsz: int
                 project=runs, name="ball", exist_ok=True)
     best = str(model.trainer.best)
     after = _scores(YOLO(best), yaml, "val", imgsz, batch, runs, "after")
-    onnx = YOLO(best).export(format="onnx", imgsz=imgsz, opset=17, simplify=True, dynamic=False)
-    out = {"onnx": onnx, "pt": best, **after, **{"base_" + k: v for k, v in before.items()}}
+    out = {"onnx": None, "pt": best, **after, **{"base_" + k: v for k, v in before.items()}}
     if has_test:
         out.update({"test_" + k: v for k, v in _scores(YOLO(best), yaml, "test", imgsz, batch, runs, "after_test").items()})
         out.update({"base_test_" + k: v for k, v in before_test.items()})
+    # ONNX 변환은 마지막에, 실패해도 학습 결과(.pt·점수)는 살린다. 2026-11-21 워커에서 ultralytics가 변환 직전에
+    # 최신 onnx를 자동 설치하다 numpy 1.x와 안 맞아(ml_dtypes import 오류) 60번 학습한 결과를 통째로 잃었다.
+    # 실패하면 .pt를 내려받아 PC에서 같은 설정으로 변환한다.
+    try:
+        out["onnx"] = YOLO(best).export(format="onnx", imgsz=imgsz, opset=17, simplify=True, dynamic=False)
+    except Exception as e:  # noqa: BLE001 — 변환 실패는 기록만 한다
+        out["export_error"] = f"{type(e).__name__}: {e}"[:500]
     return out
 
 

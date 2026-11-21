@@ -11,3 +11,8 @@ onnxruntime>=1.18,<2
 # ultralytics가 끌어오는 GUI용 opencv-python을 numpy 1.x 호환 버전으로 고정하고, 설치 후 headless로 교체
 opencv-python<4.11
 opencv-python-headless>=4.9,<4.11
+# 공 모델 학습 후 ONNX 변환용 — 미리 깔아 두지 않으면 ultralytics가 변환 직전에 최신판을 자동 설치하는데,
+# 그 최신판이 numpy 1.x와 안 맞아 변환이 죽었다 (2026-11-21). PC에서 변환이 되는 조합으로 고정한다.
+onnx==1.23.2
+ml_dtypes==0.5.4
+onnxslim==0.1.99
