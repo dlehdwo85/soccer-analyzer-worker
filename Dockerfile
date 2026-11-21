@@ -53,7 +53,10 @@ RUN python fetch_pitch_model.py /app/models/pitch.pt
 # 검증 장면(학습에 안 쓴 묶음)에서 진짜 공을 찾은 비율: 밤 8% → 31%, 낮 53% → 65%.
 # 2판(2026-11-13): 1판 모델의 후보 424개를 확대해 검수한 273장면을 더해 재학습 — 찾는 비율은 비슷(밤 33%)하지만
 # 엉뚱한 곳을 공으로 잡는 장면이 44장면 중 23 → 8로 줄었다.
-# 파일은 워커 저장소 models/ball_night.onnx (원본·학습 데이터: R2 balltrain/20261113_1912_v2/).
+# 5판(2026-11-21): 3경기(낮 1·밤 2)에서 4판이 놓친 구간을 골라 확대 검수한 386장면을 더한 데이터(학습 866장면)로
+# 4판에서 이어서 학습. 학습에 안 쓴 시간 구간 510장면을 고르게 뽑아 두 모델이 엇갈린 곳을 눈으로 판정하니
+# (확신도 0.25) 5판만 찾은 진짜 공 37 vs 4판만 11, 엉뚱한 검출 35 vs 37 — 낮 경기에서 크게 낫고 밤은 비슷하거나 조금 낫다.
+# 파일은 워커 저장소 models/ball_night.onnx (원본·학습 데이터: R2 balltrain/20261121_v3/).
 COPY models/ball_night.onnx /app/models/ball_night.onnx
 COPY app/__init__.py app/__init__.py
 COPY app/vision app/vision
