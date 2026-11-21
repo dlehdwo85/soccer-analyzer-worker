@@ -69,11 +69,19 @@ def train_ball_job(job, inp) -> dict:
         runpod.serverless.progress_update(job, {"percent": 2, "message": "학습 데이터 받는 중"})
         data_zip = os.path.join(work, "ball_dataset.zip")
         s3.download_file(bucket, prefix + "ball_dataset.zip", data_zip)
+        base = None
+        base_key = inp.get("base_key") or ""
+        if base_key:   # 이어서 학습할 모델 (우리 R2 balltrain/ 아래의 .pt만)
+            if not base_key.startswith("balltrain/") or ".." in base_key or not base_key.endswith(".pt"):
+                return {"status": "failed", "error": "출발 모델 위치가 올바르지 않습니다"}
+            base = os.path.join(work, "base.pt")
+            s3.download_file(bucket, base_key, base)
         from train_ball import train
         runpod.serverless.progress_update(job, {"percent": 5, "message": "공 모델 학습 중"})
         out = train(data_zip, work, epochs=int(inp.get("epochs", 60)), batch=int(inp.get("batch", 8)),
                     imgsz=int(inp.get("imgsz", 1280)), mosaic=float(inp.get("mosaic", 0.3)),
-                    patience=int(inp.get("patience", 15)))
+                    patience=int(inp.get("patience", 15)), base=base, lr0=float(inp.get("lr0", 0.002)),
+                    cos_lr=bool(inp.get("cos_lr", False)), scale=float(inp.get("scale", 0.2)))
         s3.upload_file(out["onnx"], bucket, prefix + "best.onnx")
         s3.upload_file(out["pt"], bucket, prefix + "best.pt")
         metrics = {k: v for k, v in out.items() if k not in ("onnx", "pt")}
