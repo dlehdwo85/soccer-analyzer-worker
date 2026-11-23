@@ -90,9 +90,9 @@ class AnalysisConfig:
 # 품질 단계별 검출 설정. 표준은 환경변수(YOLO_MODEL 등)를 따르고, 고정밀은 이 값이 우선한다.
 QUALITY_PRESETS: Dict[str, Dict] = {
     "standard": {},
-    # 공은 화면을 3x3으로 나눠(원본 해상도) 본다. 2쿼터에서 4분할이 직접 못 찾은 경기 장면 30개 중 9분할은
-    # 14개에서 후보를 냈고 사진으로 보니 약 11개가 진짜 공이었다 (2026-11-22). 공 검출 계산은 약 2배.
-    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_tiles": 3, "ball_full_every": 1},
+    # 공 화면 분할은 쓰지 않는다. 운영 공 모델은 1920 고정 입력이고 영상도 1920이라 전체 화면이 이미 원본 해상도다.
+    # 9분할을 켰던 2쿼터 재분석(2026-11-23, v2.6.1)은 조각이 2.7배로 확대돼 공을 직접 찾은 비율이 50% → 15%로 떨어졌다.
+    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_full_every": 1},
 }
 
 
@@ -228,8 +228,10 @@ class YoloDetector:
             cands: List[Tuple[float, float, float]] = []
             # 추적 중이면 확대 영역만 보고, 전체 화면은 가끔 확인한다 (공이 멀리 튀었을 때 대비).
             if not tracking or self._frame_no % self.BALL_FULL_EVERY == 0:
-                # 고정밀(BALL_FULL_EVERY=1)은 추적 중에도 매 장면 4분할로 본다 (GPU 전제)
-                if self.ball_tiles >= 2 and (not tracking or self.BALL_FULL_EVERY == 1):
+                cands += self._ball_predict(frame)
+                # 분할은 전체 화면 검출에 더해서만 본다. 전체 화면이 공 모델 입력보다 커서 줄여 볼 때만 의미가 있다
+                # (조각을 모델 입력 크기로 키우면 공이 학습 때보다 커 보여 오히려 놓친다).
+                if self.ball_tiles >= 2 and w > self.ball_imgsz and (not tracking or self.BALL_FULL_EVERY == 1):
                     n, ov = self.ball_tiles, 0.12
                     tw, th = int(w / n * (1 + ov)), int(h / n * (1 + ov))
                     for iy in range(n):
@@ -237,8 +239,6 @@ class YoloDetector:
                             x0 = 0 if ix == 0 else min(int(ix * w / n - (tw - w / n) / 2), w - tw)
                             y0 = 0 if iy == 0 else min(int(iy * h / n - (th - h / n) / 2), h - th)
                             cands += self._ball_predict(frame[y0:y0 + th, x0:x0 + tw], x0, y0)
-                else:
-                    cands += self._ball_predict(frame)
             if roi is not None:
                 x0, y0, x1, y1 = roi
                 cands += self._ball_predict(frame[y0:y1, x0:x1], x0, y0)
