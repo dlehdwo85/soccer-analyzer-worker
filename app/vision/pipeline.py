@@ -40,7 +40,8 @@ from .scoreboard import ScoreboardReader
 from .audio import detect_whistles, load_audio
 from .pitchlines import TouchlineFilter, halfway_line
 from .stats import compute_player_stats, pass_network, possession_timeline, team_stats
-from .tracker import (Detection, IoUTracker, Tracklet, assign_roster_slots, pieces_from_tracklets, stitch_tracklets,
+from .tracker import (Detection, IoUTracker, Tracklet, assign_roster_slots, pieces_from_tracklets, relink_chains,
+                      stitch_tracklets,
                       suggest_same_player)
 
 logger = logging.getLogger(__name__)
@@ -89,7 +90,9 @@ class AnalysisConfig:
 # 품질 단계별 검출 설정. 표준은 환경변수(YOLO_MODEL 등)를 따르고, 고정밀은 이 값이 우선한다.
 QUALITY_PRESETS: Dict[str, Dict] = {
     "standard": {},
-    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_tiles": 2, "ball_full_every": 1},
+    # 공은 화면을 3x3으로 나눠(원본 해상도) 본다. 2쿼터에서 4분할이 직접 못 찾은 경기 장면 30개 중 9분할은
+    # 14개에서 후보를 냈고 사진으로 보니 약 11개가 진짜 공이었다 (2026-11-22). 공 검출 계산은 약 2배.
+    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_tiles": 3, "ball_full_every": 1},
 }
 
 
@@ -323,8 +326,44 @@ class _TrackInfo:
     votes: List[Tuple[str, float]] = field(default_factory=list)
     labs: List[np.ndarray] = field(default_factory=list)
     apps: List[np.ndarray] = field(default_factory=list)   # 머리·반바지·양말 색 (팀원 구분용)
+    hist_sum: Optional[np.ndarray] = None   # 상체·하체 HSV 히스토그램 합 (끊긴 선수 다시 잇기용, 평균만 필요해 합으로)
+    hist_n: int = 0
+    # 초마다 외형 합 {초: [LAB 합(9), LAB 수, 히스토그램 합, 히스토그램 수]} — 조각의 처음·마지막 몇 초 외형을 따로 내려고
+    secs: Dict[int, list] = field(default_factory=dict)
     best_area: float = 0.0
     thumb: Optional[bytes] = None
+
+
+def _app_vector(ti: "_TrackInfo") -> Optional[np.ndarray]:
+    """트랙 외형: 머리·반바지·양말 LAB 중앙값(9) + 상체·하체 HSV 히스토그램 평균(144). 없는 부분은 NaN."""
+    # 길이는 늘 153 — 조각마다 길이가 다르면 여러 조각을 모아 중앙값·평균을 낼 수 없다
+    lab = np.nanmedian(np.array(ti.apps), axis=0) if ti.apps else None
+    if lab is None and ti.hist_n == 0:
+        return None
+    hist = (ti.hist_sum / ti.hist_n).astype(float) if ti.hist_n else np.full(C.HIST_LEN, np.nan)
+    return np.concatenate([lab if lab is not None else np.full(9, np.nan), hist])
+
+
+EDGE_APPEARANCE_S = 15.0
+
+
+def _edge_vectors(ti: "_TrackInfo", window_s: float = EDGE_APPEARANCE_S
+                  ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """트랙 처음·마지막 window_s초의 외형(LAB 평균 9 + 히스토그램 평균 144). 끊긴 순간 가까이의 외형으로 잇기 위해."""
+    secs = sorted(s for s in ti.secs if s >= 0)
+    if not secs:
+        return None, None
+
+    def vec(keys):
+        lab = sum((ti.secs[s][0] for s in keys), np.zeros(9))
+        ln = sum(ti.secs[s][1] for s in keys)
+        hs = [ti.secs[s][2] for s in keys if ti.secs[s][2] is not None]
+        hn = sum(ti.secs[s][3] for s in keys)
+        if not ln and not hn:
+            return None
+        return np.concatenate([lab / ln if ln else np.full(9, np.nan),
+                               (sum(hs) / hn).astype(float) if hn else np.full(C.HIST_LEN, np.nan)])
+    return (vec([s for s in secs if s <= secs[0] + window_s]), vec([s for s in secs if s >= secs[-1] - window_s]))
 
 
 def _encode_thumb(frame_rgb: np.ndarray, box) -> Optional[bytes]:
@@ -456,12 +495,28 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
 
     def run_tracker(k: int, frame_rgb: Optional[np.ndarray], dets: List):
         tracked = []
+        hists: Dict[int, np.ndarray] = {}   # 히스토그램은 추적 기록(payload)에 넣지 않는다 — 장면마다 쌓이면 메모리가 커서
         for box, conf, sample, orig in dets:
             label, lconf = clf.classify(sample)
-            tracked.append(Detection(box, conf, (label, lconf, sample.median_lab if sample else None, orig,
-                                                 sample.appearance if sample else None)))
+            det = Detection(box, conf, (label, lconf, sample.median_lab if sample else None, orig,
+                                        sample.appearance if sample else None))
+            if sample is not None and sample.hist is not None:
+                hists[id(det)] = sample.hist
+            tracked.append(det)
         for tid, det in tracker.update(k, tracked):
             ti = info[tid]
+            hh = hists.get(id(det))
+            sec = ti.secs.setdefault(int(times[k]) if k < len(times) else -1, [np.zeros(9), 0, None, 0])
+            if hh is not None:
+                hv = np.nan_to_num(hh)
+                ti.hist_sum = hv.copy() if ti.hist_sum is None else ti.hist_sum + hv
+                ti.hist_n += 1
+                sec[2] = hv.copy() if sec[2] is None else sec[2] + hv
+                sec[3] += 1
+            ap = det.payload[4]
+            if ap is not None and np.isfinite(ap).all():
+                sec[0] = sec[0] + ap
+                sec[1] += 1
             ti.votes.append((det.payload[0], det.payload[1]))
             if det.payload[2] is not None:
                 ti.labs.append(det.payload[2])
@@ -651,8 +706,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
             raw = pt.payload[3] if isinstance(pt.payload, tuple) and len(pt.payload) > 3 else pt.box
             return raw[0] < 0.03 * frame_w or raw[2] > 0.97 * frame_w
         keys = [t.tid for t in tracklets]
-        apps = {key: (np.nanmedian(np.array(info[int(key[1:])].apps), axis=0) if info[int(key[1:])].apps else None,
-                      len(info[int(key[1:])].apps)) for key in keys}
+        apps = {key: (_app_vector(info[int(key[1:])]), len(info[int(key[1:])].apps)) for key in keys}
         exits = {key: at_edge(tracker.history[int(key[1:])][-1]) for key in keys}
         enters = {key: at_edge(tracker.history[int(key[1:])][0]) for key in keys}
         hints = suggest_same_player(tracklets, mapping, apps, exits, enters, C.appearance_distance)
@@ -665,8 +719,9 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     roster_extra = 0
     if cfg.field_type != "futsal":
         try:
+            edges = {t.tid: _edge_vectors(info[int(t.tid[1:])]) for t in tracklets}
             roster_slots, roster_extra = roster_from_tracklets(
-                tracklets, mapping, apps, labels, clf.reference_lab)
+                tracklets, mapping, apps, labels, clf.reference_lab, edges=edges)
         except Exception:
             logger.exception("팀당 정원 정리 실패")
     players_obs: Dict[int, List[PlayerObs]] = defaultdict(list)
@@ -968,16 +1023,35 @@ def scoreboard_goals(board: Dict, events: List[Dict], left_team: str = "home", w
 
 def roster_from_tracklets(tracklets: Sequence[Tracklet], mapping: Dict[str, str],
                           apps: Dict[str, Tuple[Optional[np.ndarray], int]], labels: Dict[str, str],
-                          reference_lab: Dict[str, np.ndarray]) -> Tuple[Dict[str, str], int]:
+                          reference_lab: Dict[str, np.ndarray],
+                          edges: Optional[Dict[str, Tuple[Optional[np.ndarray], Optional[np.ndarray]]]] = None
+                          ) -> Tuple[Dict[str, str], int]:
     """이어 붙인 조각을 팀당 필드 10 + GK 1 칸으로 묶는다. 반환: ({조각 P번호: 칸 대표 P번호}, 정원 초과 수).
     상의 색이 자기 팀보다 상대·심판에 가깝거나 형광 조끼인 조각(심판·조끼 입은 GK)은 칸에 넣지 않는다."""
     gk_keys = {k: labels.get(k) in (C.HOME_GK, C.AWAY_GK) for k in labels}
     refs = {k: v for k, v in reference_lab.items() if k in (C.HOME, C.AWAY, C.REFEREE)}
     bad = {mapping.get(t.tid, t.tid) for t in tracklets
            if not gk_keys.get(t.tid) and C.kit_mismatch(t.color_lab, t.team, refs)}
-    pieces = [p for p in pieces_from_tracklets(tracklets, mapping, apps, gk_keys) if p.head not in bad]
+    # 1) 카메라가 끊긴 순간 한꺼번에 다시 나타난 조각을 직전에 끝난 조각과 한 번에 짝짓는다(속도 예측 + 색)
+    links = relink_chains(tracklets, mapping, apps, gk_keys, C.reid_distance, skip=bad, edges=edges)
+
+    def root(h: str) -> str:
+        seen = set()
+        while h in links and h not in seen:
+            seen.add(h)
+            h = links[h]
+        return h
+    linked = {t.tid: root(mapping.get(t.tid, t.tid)) for t in tracklets}
+    # 2) 그래도 남은 조각(오래 화면 밖에 있다 돌아온 선수)을 팀당 정원 칸에 담는다
+    pieces = [p for p in pieces_from_tracklets(tracklets, linked, apps, gk_keys) if p.head not in bad]
     slot_map, extra = assign_roster_slots(pieces, C.appearance_distance)
-    return {"P" + h[1:]: "P" + lead[1:] for h, lead in slot_map.items() if h != lead}, len(extra)
+    out: Dict[str, str] = {}
+    for t in tracklets:
+        h = mapping.get(t.tid, t.tid)
+        lead = slot_map.get(linked[t.tid], linked[t.tid])
+        if h != lead and h not in bad:
+            out["P" + h[1:]] = "P" + lead[1:]
+    return out, len(extra)
 
 
 def build_overlay(history: Dict[int, List], tid_to_pid: Dict[int, str], ball_sel: Sequence, ball_px: Sequence,

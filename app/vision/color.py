@@ -98,6 +98,7 @@ class JerseySample:
     valid_fraction: float             # 잔디 제외 후 남은 비율
     appearance: Optional[np.ndarray] = None  # (9,) 머리·반바지·양말 영역 LAB 중앙값 — 같은 팀 선수끼리 구분용
     neon: float = 0.0                 # 상체에서 형광 노랑·연두(심판 조끼) 픽셀 비율
+    hist: Optional[np.ndarray] = None  # (144,) 상체·하체 HSV 히스토그램 — 끊긴 선수 다시 잇기용 (body_hist)
 
 
 def torso_pixels_rgb(frame_rgb: np.ndarray, box: Sequence[float]) -> np.ndarray:
@@ -198,7 +199,7 @@ def sample_jersey(frame_rgb: np.ndarray, box: Sequence[float], max_pixels: int =
         valid = valid[rng.choice(len(valid), max_pixels, replace=False)]
     lab = rgb_to_lab(valid)
     return JerseySample(median_lab=np.median(lab, axis=0), pixels_lab=lab, valid_fraction=frac,
-                        appearance=body_appearance(frame_rgb, box), neon=neon)
+                        appearance=body_appearance(frame_rgb, box), neon=neon, hist=body_hist(frame_rgb, box))
 
 
 # 유니폼 상의는 팀원이 모두 같으니, 사람마다 다른 머리(머리카락·피부)·반바지·양말·축구화 색을 본다.
@@ -227,12 +228,82 @@ def body_appearance(frame_rgb: np.ndarray, box: Sequence[float]) -> Optional[np.
     return out if np.isfinite(out).any() else None
 
 
+HIST_BINS = (8, 3, 3)           # H·S·V 칸 수 → 부위마다 72칸
+HIST_PARTS = ((0.15, 0.5), (0.5, 0.95))   # 상체, 하체(반바지·다리)
+HIST_LEN = 2 * HIST_BINS[0] * HIST_BINS[1] * HIST_BINS[2]
+
+
+def body_hist(frame_rgb: np.ndarray, box: Sequence[float]) -> Optional[np.ndarray]:
+    """상체·하체(가운데 60% 폭, 잔디 제외)의 HSV 히스토그램을 부위마다 합 1로 이어 붙인 것 (144,). 못 구한 부위는 NaN.
+    같은 유니폼이라도 피부·머리·반바지 길이·양말·신발·체형에서 차이가 나 머리·반바지·양말 색 중앙값보다 잘 구분한다
+    (2쿼터 끊긴 조각 다시 잇기 시험: 5초 공백 82% → 88%)."""
+    try:
+        import cv2
+    except ImportError:  # pragma: no cover
+        return None
+    h_img, w_img = frame_rgb.shape[:2]
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if h < 30:
+        return None
+    xa, xb = max(0, int(x1 + 0.2 * w)), min(w_img, int(x2 - 0.2 * w))
+    if xb - xa < 3:
+        return None
+    nb = HIST_BINS[0] * HIST_BINS[1] * HIST_BINS[2]
+    out = np.full(HIST_LEN, np.nan, dtype=np.float32)
+    for i, (a, b) in enumerate(HIST_PARTS):
+        ya, yb = max(0, int(y1 + a * h)), min(h_img, int(y1 + b * h))
+        px = frame_rgb[ya:yb, xa:xb].reshape(-1, 3)
+        if len(px) < 12:
+            continue
+        px = px[~grass_mask_rgb(px)]
+        if len(px) < 8:
+            continue
+        hsv = cv2.cvtColor(px.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+        hi, si, vi = (np.minimum(hsv[:, 0].astype(int) * HIST_BINS[0] // 180, HIST_BINS[0] - 1),
+                      np.minimum(hsv[:, 1].astype(int) * HIST_BINS[1] // 256, HIST_BINS[1] - 1),
+                      np.minimum(hsv[:, 2].astype(int) * HIST_BINS[2] // 256, HIST_BINS[2] - 1))
+        cnt = np.bincount((hi * HIST_BINS[1] + si) * HIST_BINS[2] + vi, minlength=nb).astype(np.float32)
+        out[i * nb:(i + 1) * nb] = cnt / cnt.sum()
+    return out if np.isfinite(out).any() else None
+
+
+def hist_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """부위별 헬링거 거리(0 같음 ~ 1 전혀 다름)의 평균. 비교할 부위가 없으면 None."""
+    if a is None or b is None or len(a) != HIST_LEN or len(b) != HIST_LEN:
+        return None
+    nb = HIST_LEN // 2
+    ds = []
+    for i in range(2):
+        pa, pb = a[i * nb:(i + 1) * nb], b[i * nb:(i + 1) * nb]
+        if np.isfinite(pa).all() and np.isfinite(pb).all() and pa.sum() > 0 and pb.sum() > 0:
+            bc = float(np.sum(np.sqrt((pa / pa.sum()) * (pb / pb.sum()))))
+            ds.append(float(np.sqrt(max(0.0, 1.0 - bc))))
+    return float(np.mean(ds)) if ds else None
+
+
+def reid_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """끊긴 선수 다시 잇기용 외형 차이(대략 1 = 다른 사람). 앞 9칸은 머리·반바지·양말 LAB, 그 뒤 144칸은 body_hist.
+    LAB 색 거리/20과 히스토그램 거리/0.35의 평균."""
+    if a is None or b is None:
+        return None
+    parts = []
+    d = appearance_distance(a[:9], b[:9])
+    if d is not None:
+        parts.append(min(d / 20.0, 2.0))
+    if len(a) == 9 + HIST_LEN and len(b) == 9 + HIST_LEN:
+        h = hist_distance(a[9:], b[9:])
+        if h is not None:
+            parts.append(h / 0.35)
+    return float(np.mean(parts)) if parts else None
+
+
 def appearance_distance(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
     """두 트랙 외형(body_appearance 중앙값)의 영역별 평균 색 거리. 비교할 영역이 없으면 None."""
     if a is None or b is None:
         return None
     ds = []
-    for i in range(len(APPEARANCE_BANDS)):
+    for i in range(len(APPEARANCE_BANDS)):   # 앞 9칸만 본다 (뒤에 히스토그램이 붙어 있어도)
         pa, pb = a[3 * i:3 * i + 3], b[3 * i:3 * i + 3]
         if np.isfinite(pa).all() and np.isfinite(pb).all():
             ds.append(float(delta_e(pa, pb)[0]))

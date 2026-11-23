@@ -269,6 +269,143 @@ def stitch_tracklets(tracklets: Sequence[Tracklet], max_gap_s: float = 4.0,
     return mapping
 
 
+# ── 카메라가 끊긴 순간 한꺼번에 다시 잇기 ────────────────────────────────────
+
+def hungarian(cost: np.ndarray) -> Tuple[List[int], List[int]]:
+    """최소 비용 짝짓기(헝가리안). 직사각 행렬은 큰 값으로 채워 정사각으로 푼다. 반환: (행 목록, 열 목록)."""
+    C = np.asarray(cost, float)
+    n0, m0 = C.shape
+    n = max(n0, m0)
+    if n == 0:
+        return [], []
+    M = np.full((n, n), (C.max() if C.size else 0.0) + 1.0)
+    M[:n0, :m0] = C
+    inf = float("inf")
+    u = np.zeros(n + 1)
+    v = np.zeros(n + 1)
+    p = np.zeros(n + 1, int)
+    way = np.zeros(n + 1, int)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(n + 1, inf)
+        used = np.zeros(n + 1, bool)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            cur = M[i0 - 1] - u[i0] - v[1:]
+            free = ~used[1:]
+            upd = free & (cur < minv[1:])
+            minv[1:][upd] = cur[upd]
+            way[1:][upd] = j0
+            cand = np.where(free, minv[1:], inf)
+            j1 = int(np.argmin(cand)) + 1
+            delta = cand[j1 - 1]
+            u[p[used]] += delta
+            v[used] -= delta
+            minv[~used] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    rows, cols = [], []
+    for j in range(1, n + 1):
+        i = p[j]
+        if i and i - 1 < n0 and j - 1 < m0:
+            rows.append(i - 1)
+            cols.append(j - 1)
+    return rows, cols
+
+
+def _end_velocity(pts: Sequence[Tuple[float, float, float]], at_end: bool, win_s: float) -> np.ndarray:
+    seg = [q for q in pts if q[0] >= pts[-1][0] - win_s] if at_end else [q for q in pts if q[0] <= pts[0][0] + win_s]
+    if len(seg) < 2 or seg[-1][0] - seg[0][0] < 0.3:
+        return np.zeros(2)
+    return np.array([seg[-1][1] - seg[0][1], seg[-1][2] - seg[0][2]]) / (seg[-1][0] - seg[0][0])
+
+
+def relink_chains(tracklets: Sequence[Tracklet], mapping: Dict[str, str],
+                  appearance: Dict[str, Tuple[Optional[np.ndarray], int]], is_gk: Dict[str, bool],
+                  appearance_distance: Callable[[Optional[np.ndarray], Optional[np.ndarray]], Optional[float]],
+                  skip: Optional[set] = None, edges: Optional[Dict[str, Tuple[Optional[np.ndarray], Optional[np.ndarray]]]] = None,
+                  max_gap_s: float = 30.0, start_tol_s: float = 0.6,
+                  speed: float = 4.0, slack_m: float = 8.0, damp: float = 0.8, vel_win_s: float = 1.5,
+                  app_w: float = 0.5, app_missing: float = 0.7) -> Dict[str, str]:
+    """카메라가 확 돌거나 흐려져 여러 선수가 한꺼번에 끊기면, 다시 나타난 조각(체인)들을 같은 순간에 시작한 것끼리 묶어
+    직전 15초 안에 끝난 같은 팀 체인들과 한 번에 짝짓는다(헝가리안).
+    비용 = 예측 위치 차이(끝 위치 + 끝 속도×공백, 시작 위치 - 시작 속도×공백, 양쪽 평균) / 갈 수 있는 거리
+         + app_w × 외형 차이(appearance_distance는 대략 1 = 다른 사람으로 정규화된 값, 예: color.reid_distance).
+    정답 아는 시험(2쿼터 운영 조각을 같은 순간 일부러 잘라 다시 잇기, 2026-11-23, 끝·처음 15초 외형, 30초 창):
+    다시 같은 선수로 이은 비율 3초 공백 91%·5초 86%·10초 73%·20초 60% (이전 정원 칸 배정만: 56%·44%·27%·28%).
+    이은 것 중 맞은 비율도 거의 같다. 그래도 틀릴 수 있어 결과는 '추정' 합치기로 남긴다.
+    edges: {조각: (처음 몇 초 외형, 마지막 몇 초 외형)} — 밤 경기는 자리마다 조명이 달라, 끊긴 순간 가까이의 외형이
+    조각 전체 평균보다 정확하다. 없으면 appearance(조각 전체)를 쓴다.
+    반환: {나중 체인 대표: 이어지는 앞 체인 대표}"""
+    skip = skip or set()
+    edges = edges or {}
+    groups: Dict[str, List[Tracklet]] = {}
+    for t in tracklets:
+        groups.setdefault(mapping.get(t.tid, t.tid), []).append(t)
+    chains = []
+    for head, mem in groups.items():
+        if head in skip:
+            continue
+        mem = sorted(mem, key=lambda t: t.start[0])
+        pts = sorted((q for t in mem for q in t.points), key=lambda q: q[0])
+        n_gk = sum(len(t.points) for t in mem if is_gk.get(t.tid))
+        if len(pts) < 2 or n_gk * 2 > len(pts):
+            continue
+        a_end = (edges.get(mem[-1].tid) or (None, None))[1]
+        a_start = (edges.get(mem[0].tid) or (None, None))[0]
+        if a_end is None:
+            a_end = (appearance.get(mem[-1].tid) or (None, 0))[0]
+        if a_start is None:
+            a_start = (appearance.get(mem[0].tid) or (None, 0))[0]
+        chains.append({"head": head, "team": mem[0].team, "pts": pts, "t0": pts[0][0], "t1": pts[-1][0],
+                       "app_end": a_end, "app_start": a_start,
+                       "v_end": _end_velocity(pts, True, vel_win_s), "v_start": _end_velocity(pts, False, vel_win_s)})
+    chains.sort(key=lambda c: c["t0"])
+    batches: List[List[dict]] = []
+    for c in chains:
+        if batches and c["t0"] - batches[-1][0]["t0"] < start_tol_s:
+            batches[-1].append(c)
+        else:
+            batches.append([c])
+    links: Dict[str, str] = {}
+    taken: set = set()
+    for batch in batches:
+        t_start = batch[0]["t0"]
+        for team in sorted({c["team"] for c in batch}):
+            B = [c for c in batch if c["team"] == team]
+            A = [c for c in chains if c["team"] == team and 0 < t_start - c["t1"] <= max_gap_s and c["head"] not in taken]
+            if not A or not B:
+                continue
+            big = 99.0
+            M = np.full((len(A), len(B)), big)
+            for i, a in enumerate(A):
+                pa = np.array(a["pts"][-1][1:])
+                for j, b in enumerate(B):
+                    gap = b["t0"] - a["t1"]
+                    pb = np.array(b["pts"][0][1:])
+                    d = (np.linalg.norm(pa + a["v_end"] * gap * damp - pb)
+                         + np.linalg.norm(pb - b["v_start"] * gap * damp - pa)) / 2
+                    reach = speed * gap + slack_m
+                    if d > reach:
+                        continue
+                    da = appearance_distance(a["app_end"], b["app_start"])
+                    M[i, j] = d / reach + app_w * (app_missing if da is None else min(da, 2.0))
+            for i, j in zip(*hungarian(M)):
+                if M[i, j] < big:
+                    links[B[j]["head"]] = A[i]["head"]
+                    taken.add(A[i]["head"])
+    return links
+
+
 # ── 화면 밖으로 나갔다 돌아온 선수 후보 ───────────────────────────────────────
 
 @dataclass
@@ -400,9 +537,9 @@ def pieces_from_tracklets(tracklets: Sequence[Tracklet], mapping: Dict[str, str]
 def assign_roster_slots(pieces: Sequence[RosterPiece],
                         appearance_distance: Callable[[Optional[np.ndarray], Optional[np.ndarray]], Optional[float]],
                         field_slots: int = 10, gk_slots: int = 1, min_seconds: float = 2.0,
-                        overlap_tol_s: float = 0.5, avg_speed: float = 6.0, slack_m: float = 8.0,
-                        max_app_de: float = 25.0, open_cost: float = 1.0, batch_s: float = 1.0
-                        ) -> Tuple[Dict[str, str], List[str]]:
+                        overlap_tol_s: float = 0.5, avg_speed: float = 4.0, slack_m: float = 8.0,
+                        max_app_de: float = 25.0, open_cost: float = 1.0, batch_s: float = 1.0,
+                        move_w: float = 4.0) -> Tuple[Dict[str, str], List[str]]:
     """경기장 안에는 팀마다 필드 선수 10명 + GK 1명뿐이다. 선수 조각을 시간 순으로 보며 팀·역할별 정원만큼의
     칸에 담아, 화면 밖에 나갔다 돌아와 새 번호가 붙은 사람을 '지금 비어 있는 칸'(화면 밖에 나가 있는 선수) 중
     하나로 모은다.
@@ -447,7 +584,10 @@ def assign_roster_slots(pieces: Sequence[RosterPiece],
                                 continue
                             move = d / reach
                         da = appearance_distance(s.appearance(), p.appearance)
-                        cost = (0.5 if da is None else min(da / max_app_de, 1.5))                             + abs(s.lateral() - p.lateral) / 15.0 + 0.5 * move
+                        # 이동 거리를 무겁게 본다(4배, 평균 4m/s): 2쿼터에서 끊기지 않은 체인을 일부러 잘라 재 보니
+                        # 다시 같은 칸으로 이은 비율이 5초 공백 29%→46%, 10초 공백 18%→32%로 올랐다 (2026-11-22).
+                        # 같은 유니폼이라 색 단서는 약하고, 팀 중심 기준 자리 단서는 오히려 낮췄다(25%).
+                        cost = (0.5 if da is None else min(da / max_app_de, 1.5))                             + abs(s.lateral() - p.lateral) / 15.0 + move_w * move
                         pairs.append((cost, bi, si))
                 pairs.sort()
                 used_b, used_s = set(), set()
