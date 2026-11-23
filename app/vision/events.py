@@ -336,9 +336,54 @@ class _BallIndex:
         return (xb - xa) / (tb - ta), (yb - ya) / (tb - ta)
 
 
-def _shot_check(a: Spell, bi: _BallIndex, cfg: EventConfig, direction: int
-                ) -> Optional[Dict]:
-    """빠르고 골문 쪽(각도 40° 이내)으로 향한 킥이면 슈팅 정보를, 아니면 None."""
+def _shot_check(a: Spell, bi: _BallIndex, cfg: EventConfig, direction: int,
+                next_t0: Optional[float] = None) -> Optional[Dict]:
+    """빠르고 골문 쪽(각도 40° 이내)으로 향한 킥이면 슈팅 정보를, 아니면 None.
+    next_t0: 다음 선수가 공을 잡은 시각 — 그 전에 공이 골라인을 넘었어야 라인 판정 슈팅이 된다."""
+    shot = _shot_by_release(a, bi, cfg, direction)
+    if shot is None and cfg.trust_bounds:
+        shot = _shot_over_line(a, bi, cfg, direction, next_t0)
+    return shot
+
+
+def _shot_over_line(a: Spell, bi: _BallIndex, cfg: EventConfig, direction: int,
+                    next_t0: Optional[float] = None) -> Optional[Dict]:
+    """공격하는 팀이 공을 가진 직후(앞 0.8초~뒤 1초) 공이 빠르게 골문 폭 근처로 골라인을 넘어가 머물면 슈팅.
+
+    골문 바로 앞에서 찬 공은 선수가 공을 가진 시간이 공이 라인을 넘은 뒤까지 잡히기도 해서, 그 뒤 0.4초 속도로
+    보는 기본 판정이 놓친다 (바모스전 2쿼터 8:39 — 공 위치가 더 잡힌 v2.6.3 재분석에서 '실패한 패스'가 됐다).
+    골이 아닌 공이 골문 폭 안쪽으로 라인을 넘었으면 크로스바 위·골대 옆이므로 유효 슈팅이 아닌 것으로 둔다."""
+    s = max(a.s, 1e-6)
+    goal_x = cfg.length if direction > 0 else 0.0
+    goal_y = cfg.width / 2
+    half = cfg.goal_width / 2
+    if math.hypot(goal_x - a.x1, goal_y - a.y1) * s > 20.0:
+        return None
+
+    def behind(p) -> bool:
+        return (p[1] - goal_x) * direction * s > 0.5
+
+    end = a.t1 + 1.0
+    if next_t0 is not None and next_t0 > a.t1:
+        end = min(end, next_t0)     # 라인을 넘기 전에 누가 받았으면(동료에게 간 패스 등) 슈팅이 아니다
+    pts = bi.path(a.t1 - 0.8, end)
+    for i in range(1, len(pts) - 1):
+        prev, p, q = pts[i - 1], pts[i], pts[i + 1]
+        if behind(prev) or not behind(p) or not behind(q) or p[0] - prev[0] > 1.0:
+            continue
+        if abs(p[2] - goal_y) * s > cfg.goal_width / 2 + 2.0:
+            return None         # 골문에서 먼 곳으로 나갔다 — 크로스·걷어 낸 공
+        speed = math.hypot(p[1] - prev[1], p[2] - prev[2]) * s / max(p[0] - prev[0], 1e-6)
+        if speed < cfg.kick_speed:
+            return None         # 천천히 굴러 나갔다
+        if speed > PASS_MAX_SPEED:
+            return None         # 사람이 찰 수 없는 속도 — 카메라가 확 돌 때 위치가 튄 것 (2쿼터 실측 33·42·83m/s)
+        return {"speed_ms": round(speed, 1), "y_cross": p[2], "goal_x": goal_x, "goal_y": goal_y, "half": half,
+                "outcome": "off_target", "t": p[0]}
+    return None
+
+
+def _shot_by_release(a: Spell, bi: _BallIndex, cfg: EventConfig, direction: int) -> Optional[Dict]:
     vel = bi.release_velocity(a.t1, window=0.4)
     if vel is None:
         return None
@@ -472,7 +517,7 @@ def detect_events(frames: Sequence[Frame], cfg: Optional[EventConfig] = None
         t_next = b.t0 if b and gap <= cfg.max_link_s else a.t1 + cfg.max_link_s
 
         # 슈팅은 킥 직후 궤적만으로 판정하므로, 공이 나중에 사라져도 판정한다.
-        shot = _shot_check(a, bi, cfg, direction)
+        shot = _shot_check(a, bi, cfg, direction, next_t0=b.t0 if b else None)
         cross = bool(shot) and _is_cross(a, b, cfg, shot)
         if cross:
             shot = None     # 옆에서 골문 앞으로 올린 공 — 슈팅이 아니라 패스(크로스)로 본다
@@ -556,7 +601,11 @@ def _shot_event(a: Spell, b: Optional[Spell], bi: _BallIndex, cfg: EventConfig, 
     reached = next(((t, x, y) for t, x, y in path if abs(x - goal_x) * a.s <= 1.5), None)
     blocked = (b is not None and b.team != a.team and b.t0 - a.t1 <= 2.0
                and abs(b.x0 - goal_x) * a.s > cfg.blocked_min_goal_dist)
-    if reached is not None and not blocked:
+    if shot.get("outcome"):
+        # 골라인을 넘어간 것으로 판정한 슈팅 (_shot_over_line) — 넘어간 곳이 끝점
+        outcome, end = shot["outcome"], (goal_x, shot["y_cross"])
+        reached = (max(shot["t"], a.t1), goal_x, shot["y_cross"])
+    elif reached is not None and not blocked:
         outcome = "on_target" if abs(reached[2] - goal_y) <= half + 0.5 else "off_target"
         end = (reached[1], reached[2])
     elif blocked:
