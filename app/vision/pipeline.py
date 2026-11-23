@@ -161,7 +161,9 @@ class YoloDetector:
         p = QUALITY_PRESETS.get(quality or "standard", {})
         det = cls(model=p.get("model") or os.environ.get("YOLO_MODEL"),
                   imgsz=p.get("imgsz") or (int(os.environ["YOLO_IMGSZ"]) if os.environ.get("YOLO_IMGSZ") else None))
-        if "ball_tiles" in p and not os.environ.get("YOLO_BALL_TILES"):
+        # 워커 이미지는 YOLO_BALL_TILES=0을 기본으로 깔아 두므로 '0'은 지정 안 한 것으로 본다
+        # (그동안 고정밀 분석의 공 분할이 한 번도 적용되지 않았다 — 2026-11-23 2쿼터 재분석에서 발견)
+        if "ball_tiles" in p and int(os.environ.get("YOLO_BALL_TILES") or 0) == 0:
             det.ball_tiles = p["ball_tiles"]
         if "ball_full_every" in p:
             det.BALL_FULL_EVERY = p["ball_full_every"]
