@@ -30,7 +30,8 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 import numpy as np
 
 from . import color as C
-from .ball import in_play_candidates, interpolate_gaps, select_ball_positions
+from .ball import (drop_weak_at_feet, in_play_candidates, interpolate_gaps, select_ball_positions,
+                   select_ball_positions_bidir)
 from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events, find_kickoff, fit_to_extents
 from .pitch import GOAL_WIDTH, POSSESSION_RADIUS_H, POSSESSION_RADIUS_M, PitchMapper
@@ -92,8 +93,12 @@ QUALITY_PRESETS: Dict[str, Dict] = {
     "standard": {},
     # 공 화면 분할은 쓰지 않는다. 운영 공 모델은 1920 고정 입력이고 영상도 1920이라 전체 화면이 이미 원본 해상도다.
     # 9분할을 켰던 2쿼터 재분석(2026-11-23, v2.6.1)은 조각이 2.7배로 확대돼 공을 직접 찾은 비율이 50% → 15%로 떨어졌다.
-    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_full_every": 1},
+    # ball_conf: 공 후보를 0.07까지 받는다. 새 궤적 시작은 그대로 0.25↑라 약한 후보는 이어지는 궤적 근처에서만 쓰인다.
+    "max": {"analysis_fps": 15.0, "model": "yolov8x.pt", "imgsz": 1280, "ball_full_every": 1, "ball_conf": 0.07},
 }
+
+# 긴 공백 대략 위치를 잇는 최대 길이(초) — 화면 표시·'공 위치 파악' 비율용, 이벤트 판정에는 안 쓴다
+BALL_ROUGH_GAP_S = 8.0
 
 
 # ── 검출기 ──────────────────────────────────────────────────────────────────
@@ -167,6 +172,8 @@ class YoloDetector:
             det.ball_tiles = p["ball_tiles"]
         if "ball_full_every" in p:
             det.BALL_FULL_EVERY = p["ball_full_every"]
+        if "ball_conf" in p and det.ball_model is not None:
+            det.ball_conf = min(det.ball_conf, p["ball_conf"])
         return det
 
     def _ball_predict(self, img, x0: int = 0, y0: int = 0) -> List[Tuple[float, float, float]]:
@@ -556,6 +563,7 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
                 logger.exception("터치라인 인식 실패")
                 touch = None
         balls = in_play_candidates(balls, persons, frame_h)   # 벤치 옆 여분의 공·조명 같은 경기 밖 후보 제거
+        balls = drop_weak_at_feet(balls, persons)              # 약한 후보 중 선수 발(흰 축구화) 자리는 버린다
         try:
             board.add(t, frame_rgb)
         except Exception:  # 부가 기능 — 실패해도 분석은 계속
@@ -749,7 +757,10 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     # 실측(1080p 조기축구 1분): 보간 0.8초 → 공 위치 파악 66%, 2.5초 → 91%. 발밑에 가려진 공이 대부분이라
     # 양 끝 이동 속도가 화면 폭의 0.6배/초를 넘는 공백(시야 밖으로 나간 경우)만 잇지 않는다.
     dedicated_ball = getattr(detector, "ball_model", None) is not None
-    ball_sel = select_ball_positions(
+    # 공 전용 모델은 앞뒤 양방향으로 추적한다 — 다시 잡힌 공에서 거슬러 올라가며 궤적 근처의 약한 후보를 받는다
+    # (2쿼터 50초 실험: 후보 0.07↑ + 발 자리 약한 후보 제거 + 양방향 → 직접 검출 +2.3%p, 새 점 19개 중 맞음 15개)
+    select = select_ball_positions_bidir if dedicated_ball else select_ball_positions
+    ball_sel = select(
         ball_cands, times, frame_w, min_conf_new=getattr(detector, "ball_min_conf_new", 0.3),
         memory_s=1.5 if dedicated_ball else 1.0)
     # 카메라가 공을 따라 돌아가는 사이 놓친 공은 화면 이동을 따라 잇는다 (화면 중심의 안정화 좌표)
@@ -759,6 +770,13 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
                                max_speed_px_s=0.6 * frame_w if dedicated_ball else None,
                                cam_centers=cam_centers if dedicated_ball else None,
                                cam_min_shift_px=0.05 * frame_w)
+    # 긴 공백(최대 BALL_ROUGH_GAP_S초)의 대략 위치 — 화면 표시와 '공 위치 파악' 비율에만 쓰고 이벤트 판정에는 안 쓴다.
+    # 2쿼터 공백은 대부분 경기 중(긴 패스·발밑 가림)이었다. 잡힌 공을 일부러 가리고 직선으로 이어 본 실측:
+    # 3초 공백 67%·5초 50%·8초 41%가 실제 위치 60px(화면 폭 3%) 안 — 짧은 공백보다 부정확해서 따로 표시한다.
+    ball_est = ball_px
+    if dedicated_ball:
+        ball_est = interpolate_gaps(ball_px, times, max_gap_s=BALL_ROUGH_GAP_S, cam_centers=cam_centers,
+                                    cam_max_gap_s=BALL_ROUGH_GAP_S, cam_min_shift_px=0.05 * frame_w)
     frames = []
     for i, t in enumerate(times):
         b = ball_px[i]
@@ -780,7 +798,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         # 하프라인이 충분히 잡혔으면 그 위치를 경기장 가운데로 맞춘다 (양쪽 골대 거리가 같아진다)
         center = float(np.median(halfway_x)) if len(halfway_x) >= 20 else None
         frames = fit_to_extents(frames, length, width, center_x=center)
-    ball_seen = sum(1 for b in ball_px if b is not None) / len(times)
+    ball_seen = sum(1 for b in ball_px if b is not None) / len(times)       # 이벤트 판정에 쓴 위치
+    ball_rough = sum(1 for b in ball_est if b is not None) / len(times)     # 긴 공백 대략 위치까지
     if ball_seen < 0.3:
         warnings.append(f"공이 영상의 {ball_seen * 100:.0f}% 구간에서만 검출되어 볼 이벤트가 적게 잡혔을 수 있습니다.")
     camera_moving = cam is not None and cam.travel() > 0.3 * frame_w
@@ -806,7 +825,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
         "metric_positions": mapper.calibrated or registered,
         "registration": reg_info,
         "goalkeepers": gk_info,
-        "ball_detected_pct": round(ball_seen * 100, 1),          # 위치를 정한 장면 (앞뒤로 이어 붙인 추정 포함)
+        "ball_detected_pct": round(ball_rough * 100, 1),         # 위치를 정한 장면 (긴 공백의 대략 위치까지 포함)
+        "ball_events_pct": round(ball_seen * 100, 1),            # 이벤트 판정에 쓴 장면 (직접 + 짧은 공백 이음)
         "ball_direct_pct": round(sum(1 for b in ball_sel if b is not None) / len(times) * 100, 1),  # 모델이 직접 잡은 장면
         "raw_tracks": len(tracker.history),
         "removed_outside_pitch": removed_outside,
@@ -863,7 +883,8 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
     try:
         result["overlay"] = build_overlay(
             tracker.history, {int(k[1:]): "P" + mapping.get(k, k)[1:] for k in geo},
-            ball_sel, ball_px, cam_T, frame_w, frame_h, cfg.start_seconds, stride / fps_video, len(times))
+            ball_sel, ball_px, cam_T, frame_w, frame_h, cfg.start_seconds, stride / fps_video, len(times),
+            ball_est=ball_est)
     except Exception:  # 검수용 부가 데이터 — 실패해도 분석 결과는 살린다
         logger.exception("영상 검수 오버레이 생성 실패")
     return result
@@ -1058,8 +1079,9 @@ def roster_from_tracklets(tracklets: Sequence[Tracklet], mapping: Dict[str, str]
 
 def build_overlay(history: Dict[int, List], tid_to_pid: Dict[int, str], ball_sel: Sequence, ball_px: Sequence,
                   cam_T: Sequence[np.ndarray], frame_w: int, frame_h: int, start_s: float, step: float,
-                  n: int) -> Dict:
-    """영상 위에 그릴 프레임별 선수 박스와 공 위치. 모두 원래 화면 픽셀 좌표(카메라 보정 전)로 되돌린다."""
+                  n: int, ball_est: Optional[Sequence] = None) -> Dict:
+    """영상 위에 그릴 프레임별 선수 박스와 공 위치. 모두 원래 화면 픽셀 좌표(카메라 보정 전)로 되돌린다.
+    공 표시: 1 직접 검출 · 0 짧은 공백 이음(이벤트 판정에 씀) · 2 긴 공백 대략 위치(표시만)."""
     tracks: Dict[str, List[List[int]]] = defaultdict(list)
     for tid, pts in history.items():
         pid = tid_to_pid.get(tid)
@@ -1078,11 +1100,12 @@ def build_overlay(history: Dict[int, List], tid_to_pid: Dict[int, str], ball_sel
         return float(q[0] / q[2]), float(q[1] / q[2])
 
     ball = []
-    for k, b in enumerate(ball_px):
+    for k, b in enumerate(ball_est if ball_est is not None else ball_px):
         if b is None:
             continue
         x, y = to_raw(k, b[0], b[1])
-        ball.append([k, int(round(x)), int(round(y)), 1 if ball_sel[k] is not None else 0])
+        flag = 1 if ball_sel[k] is not None else (0 if ball_px[k] is not None else 2)
+        ball.append([k, int(round(x)), int(round(y)), flag])
     return {"v": 1, "w": int(frame_w), "h": int(frame_h), "start_s": float(start_s), "step": float(step),
             "n": int(n), "tracks": dict(tracks), "ball": ball}
 

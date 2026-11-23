@@ -57,6 +57,21 @@ def select_ball_positions(cands_per_frame: Sequence[Sequence[BallCand]], times: 
     return drop_excursions(remove_spikes(out, times, frame_w), times, frame_w)
 
 
+def select_ball_positions_bidir(cands_per_frame: Sequence[Sequence[BallCand]], times: Sequence[float],
+                                frame_w: float, min_conf_new: float = 0.3, memory_s: float = 1.0) -> List[BallPos]:
+    """앞으로 한 번, 뒤로 한 번 추적해서 합친다.
+
+    앞으로만 추적하면 공을 놓친 뒤 강한 후보(min_conf_new)가 나올 때까지 약한 후보를 못 쓴다. 뒤로 추적하면
+    다시 잡힌 공에서 거꾸로 거슬러 올라가며 그 사이의 약한 후보를 궤적 근처에서만 받는다.
+    두 방향이 같은 장면에 다른 점을 고르면 앞쪽 결과를 둔다. 합친 뒤 튀는 점·묶음은 다시 지운다."""
+    fwd = select_ball_positions(cands_per_frame, times, frame_w, min_conf_new=min_conf_new, memory_s=memory_s)
+    rev_t = [-t for t in reversed(times)]
+    rev = list(reversed(select_ball_positions(list(reversed(cands_per_frame)), rev_t, frame_w,
+                                              min_conf_new=min_conf_new, memory_s=memory_s)))
+    merged = [a if a is not None else b for a, b in zip(fwd, rev)]
+    return drop_excursions(remove_spikes(merged, times, frame_w), times, frame_w)
+
+
 def in_play_candidates(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[float, float, float, float], float]],
                        frame_h: float, margin_h: float = 3.0, top_frac: float = 0.04) -> List[BallCand]:
     """경기가 벌어지는 곳 밖의 공 후보를 버린다 (원래 화면 좌표).
@@ -73,6 +88,27 @@ def in_play_candidates(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[
     x0, x1 = np.percentile(xs, 10) - margin_h * h, np.percentile(xs, 90) + margin_h * h
     y0, y1 = np.percentile(ys, 10) - margin_h * h, np.percentile(ys, 90) + margin_h * h
     return [b for b in balls if x0 <= b[0] <= x1 and y0 <= b[1] <= y1 and b[1] >= top_frac * frame_h]
+
+
+def drop_weak_at_feet(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[float, float, float, float], float]],
+                      weak_below: float = 0.15) -> List[BallCand]:
+    """신뢰도 weak_below 미만 후보 중 선수 발 자리(상자 아래 20%~아래로 10%)에 있는 것을 버린다.
+
+    밤 경기 2쿼터 실측: 0.07~0.15 후보로 새로 잡힌 점 37개 중 11개가 걷는 선수의 흰 축구화였고 모두 발 자리였다.
+    이 규칙을 넣으면 새 점 19개 중 틀림 4개(79% 정확). 강한 후보(발밑 드리블 공)는 그대로 둔다."""
+    out = []
+    for b in balls:
+        if b[2] < weak_below:
+            feet = False
+            for (x1, y1, x2, y2), _ in persons:
+                h, w = y2 - y1, x2 - x1
+                if x1 - 0.15 * w <= b[0] <= x2 + 0.15 * w and y2 - 0.2 * h <= b[1] <= y2 + 0.1 * h:
+                    feet = True
+                    break
+            if feet:
+                continue
+        out.append(b)
+    return out
 
 
 def remove_spikes(pos: List[BallPos], times: Sequence[float], frame_w: float,
