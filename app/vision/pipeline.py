@@ -1140,6 +1140,8 @@ def postprocess(frames: Sequence[Frame], cfg: AnalysisConfig, length: float, wid
     ecfg = cfg.event_config(length, width, calibrated=calibrated)
     # 보정 없이 카메라까지 움직이면 화면 가장자리가 경기장 경계가 아니다 → '아웃' 판정을 끈다.
     ecfg.trust_bounds = calibrated or not meta.get("camera_moving", False)
+    # 경기장 선 자동 인식 위치(정밀 판정 전이어도)면 골라인을 넘긴 슈팅 판정은 쓴다 — 바모스전 2쿼터 8:39
+    ecfg.metric_positions = calibrated or bool(meta.get("metric_positions"))
     if meta.get("auto_calibrated"):
         ecfg.out_margin_m = 2.5
         ecfg.out_restart_within_m = 7.0

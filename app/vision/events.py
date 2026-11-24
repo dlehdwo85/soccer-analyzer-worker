@@ -81,6 +81,8 @@ class EventConfig:
     # 경기장 경계를 믿을 수 있는가. 보정이 없고 카메라가 움직이면 화면 밖 = 경기장 밖이 아니므로
     # '아웃'으로 단정하지 않는다 (공이 시야에서 벗어난 것뿐일 수 있다).
     trust_bounds: bool = True
+    # 위치가 경기장 미터(사용자 지정 또는 경기장 선 자동 인식)인가 — 카메라가 움직여도 골라인 위치는 믿을 수 있다
+    metric_positions: bool = False
     out_margin_m: float = 1.0           # 공이 선 밖으로 이만큼 넘어가야 아웃 (자동 선 인식은 오차가 있어 더 크게 잡는다)
     # 자동 선 인식: 높이 뜬 공은 바닥 위치로 옮기면 선 밖으로 나간 것처럼 보인다. 진짜 아웃은 선 근처에서 다시 시작하므로
     # (드로잉·코너킥·골킥) 다음 점유가 선에서 이 거리 안에서 시작할 때만 아웃으로 본다. None이면 확인하지 않는다.
@@ -341,7 +343,7 @@ def _shot_check(a: Spell, bi: _BallIndex, cfg: EventConfig, direction: int,
     """빠르고 골문 쪽(각도 40° 이내)으로 향한 킥이면 슈팅 정보를, 아니면 None.
     next_t0: 다음 선수가 공을 잡은 시각 — 그 전에 공이 골라인을 넘었어야 라인 판정 슈팅이 된다."""
     shot = _shot_by_release(a, bi, cfg, direction)
-    if shot is None and cfg.trust_bounds:
+    if shot is None and (cfg.trust_bounds or cfg.metric_positions):
         shot = _shot_over_line(a, bi, cfg, direction, next_t0)
     return shot
 
