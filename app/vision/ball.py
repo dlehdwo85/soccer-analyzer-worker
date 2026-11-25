@@ -90,6 +90,18 @@ def in_play_candidates(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[
     return [b for b in balls if x0 <= b[0] <= x1 and y0 <= b[1] <= y1 and b[1] >= top_frac * frame_h]
 
 
+def soften_out_of_play(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[float, float, float, float], float]],
+                       frame_h: float, cap_conf: float, top_frac: float = 0.04) -> List[BallCand]:
+    """경기 영역 밖 후보를 버리는 대신 신뢰도를 cap_conf로 낮춘다(화면 맨 위 조명은 그대로 버린다).
+
+    cap_conf를 새 궤적 시작 기준보다 낮게 주면, 영역 밖 후보는 이미 따라가던 공을 이어 갈 때만 쓰이고
+    공을 새로 찾는 데는 못 쓰인다(벤치 옆 여분의 공으로 궤적이 시작되지 않는다).
+    밤 경기 2쿼터 실측: 선수들 발 위치로 잡는 경기 영역이 좁아, 공중에 뜬 공·골킥 준비 공·사이드라인 쪽 공을
+    버리고 있었다(8:59 헤딩 공을 버려 신발로 튐). 재현 2,069장면에서 직접 검출 +254, 확대 확인 20곳 모두 진짜 공."""
+    inside = set(in_play_candidates(balls, persons, frame_h, top_frac=top_frac))
+    return [b if b in inside else (b[0], b[1], min(b[2], cap_conf)) for b in balls if b[1] >= top_frac * frame_h]
+
+
 def drop_weak_at_feet(balls: Sequence[BallCand], persons: Sequence[Tuple[Tuple[float, float, float, float], float]],
                       weak_below: float = 0.15) -> List[BallCand]:
     """신뢰도 weak_below 미만 후보 중 선수 발 자리(상자 아래 20%~아래로 10%)에 있는 것을 버린다.

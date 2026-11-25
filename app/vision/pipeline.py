@@ -31,7 +31,7 @@ import numpy as np
 
 from . import color as C
 from .ball import (drop_weak_at_feet, in_play_candidates, interpolate_gaps, select_ball_positions,
-                   select_ball_positions_bidir)
+                   select_ball_positions_bidir, soften_out_of_play)
 from .camera import CameraMotion, stationary
 from .events import EventConfig, Frame, PlayerObs, detect_events, find_kickoff, fit_to_extents
 from .pitch import GOAL_WIDTH, POSSESSION_RADIUS_H, POSSESSION_RADIUS_M, PitchMapper
@@ -562,7 +562,12 @@ def analyze_video(source: str, cfg: AnalysisConfig, detector: Optional[Detector]
             except Exception:  # 부가 기능 — 실패하면 거르지 않는다
                 logger.exception("터치라인 인식 실패")
                 touch = None
-        balls = in_play_candidates(balls, persons, frame_h)   # 벤치 옆 여분의 공·조명 같은 경기 밖 후보 제거
+        if getattr(detector, "ball_model", None) is not None:
+            # 경기 영역 밖 후보는 버리지 않고 '따라가던 공 잇기'에만 쓴다 (새 궤적 시작 기준보다 낮은 신뢰도로)
+            balls = soften_out_of_play(balls, persons, frame_h,
+                                       cap_conf=0.8 * getattr(detector, "ball_min_conf_new", 0.3))
+        else:
+            balls = in_play_candidates(balls, persons, frame_h)   # 벤치 옆 여분의 공·조명 같은 경기 밖 후보 제거
         balls = drop_weak_at_feet(balls, persons)              # 약한 후보 중 선수 발(흰 축구화) 자리는 버린다
         try:
             board.add(t, frame_rgb)
